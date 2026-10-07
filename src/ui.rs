@@ -1,4 +1,5 @@
-use crate::app::{App, ListPos, Mode, View, has_problem};
+use crate::app::{App, JobKind, ListPos, Mode, View, has_problem};
+use crate::diff::Change;
 use crate::fmt;
 use crate::tree::{Kind, NodeId, SortKey, Tree, flags};
 use crate::treemap::{self, Rect as FRect};
@@ -7,7 +8,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
@@ -46,6 +47,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::Treemap => draw_treemap(f, body, app),
         View::Files => draw_files(f, body, app),
         View::Types => draw_types(f, body, app),
+        View::Changes => draw_changes(f, body, app),
     }
     draw_footer(f, footer, app);
 
@@ -53,6 +55,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Normal => {}
         Mode::Help => draw_help(f),
         Mode::SavePrompt(buf) => draw_prompt(f, buf),
+        Mode::ConfirmDelete(id) => draw_confirm_delete(f, app, *id),
+        Mode::Errors(errors) => draw_errors(f, errors),
     }
 }
 
@@ -194,6 +198,12 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
     if app.meta.one_file_system {
         right += " · one fs";
     }
+    if !app.meta.exclude.is_empty() {
+        right += &format!(" · {} excludes", app.meta.exclude.len());
+    }
+    if let Some(d) = &app.diff {
+        right += &format!(" · vs {}", fmt::ago(d.base_time));
+    }
     right.push(' ');
     render_lr(
         f.buffer_mut(),
@@ -208,7 +218,11 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         let p = &job.progress;
         Line::from(vec![
             Span::styled(
-                " ⟳ refreshing ",
+                if job.kind == JobKind::Delete {
+                    " ✗ deleting "
+                } else {
+                    " ⟳ refreshing "
+                },
                 Style::new().fg(Color::Black).bg(Color::Yellow),
             ),
             Span::raw(format!(
@@ -266,6 +280,12 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                 ("?", "help"),
             ],
             View::Types => &[("⏎", "list files of type"), ("⌫", "up"), ("?", "help")],
+            View::Changes => &[
+                ("⏎", "show in tree"),
+                ("⌫", "up"),
+                ("R", "rescan & compare"),
+                ("?", "help"),
+            ],
         };
         let mut spans = vec![Span::raw(" ")];
         for (k, d) in hints {
@@ -368,6 +388,7 @@ fn list_block(title: String) -> Block<'static> {
 
 fn draw_tree(f: &mut Frame, area: Rect, app: &mut App) {
     app.ensure_rows();
+    app.ensure_diff();
     let block = list_block(String::new());
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -407,6 +428,9 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &mut App) {
                 Style::new().fg(heat(fr)).bg(Color::Indexed(235)),
             ),
         ];
+        if let Some(d) = &app.diff {
+            spans.push(delta_span(d.change(tree, row.id, app.use_disk)));
+        }
         if wide {
             let items = if n.is_dir() {
                 fmt::count(n.items - 1)
@@ -723,6 +747,8 @@ fn draw_help(f: &mut Frame) {
         ("R", "rescan everything"),
         ("w ^s", "save snapshot"),
         ("esc", "cancel scan / back / quit"),
+        ("d del", "delete selected (asks first)"),
+        ("5", "changes since baseline snapshot / previous scan"),
         ("q", "quit"),
     ];
     let mut lines: Vec<Line> = keys
@@ -769,4 +795,195 @@ fn draw_prompt(f: &mut Frame, buf: &str) {
         inner,
     );
     f.set_cursor_position((inner.x + 1 + shown.chars().count() as u16, inner.y));
+}
+
+fn delta_span(c: Option<Change>) -> Span<'static> {
+    match c {
+        Some(Change::New) => Span::styled(format!(" {:>9}", "new"), Style::new().fg(Color::Yellow)),
+        Some(Change::Delta(d)) if d > 0 => Span::styled(
+            format!(" {:>9}", fmt::delta(d)),
+            Style::new().fg(Color::LightRed),
+        ),
+        Some(Change::Delta(d)) if d < 0 => Span::styled(
+            format!(" {:>9}", fmt::delta(d)),
+            Style::new().fg(Color::LightGreen),
+        ),
+        _ => Span::raw(" ".repeat(10)),
+    }
+}
+
+fn draw_changes(f: &mut Frame, area: Rect, app: &mut App) {
+    app.ensure_changes();
+    let Some(diff) = &app.diff else {
+        let lines = vec![
+            Line::raw(""),
+            Line::raw("  Nothing to compare against yet."),
+            Line::raw(""),
+            Line::styled(
+                "  Press R (or r on a directory) to rescan and compare with the current state,",
+                Style::new().fg(DIM),
+            ),
+            Line::styled(
+                "  or start with --diff old.dut, or --load old.dut --refresh.",
+                Style::new().fg(DIM),
+            ),
+        ];
+        f.render_widget(Paragraph::new(lines).block(list_block(String::new())), area);
+        return;
+    };
+    let tree = app.tree.as_ref().unwrap();
+    let sum = &app.changes_sum;
+    let title = format!(
+        " +{} grown · -{} shrunk · {} new · {} removed · vs {} ",
+        fmt::size(sum.grown),
+        fmt::size(sum.shrunk),
+        fmt::count(sum.new),
+        fmt::count(sum.removed),
+        fmt::ago(diff.base_time),
+    );
+    let block = list_block(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if app.changes.is_empty() {
+        f.render_widget(Line::styled("  (no changes)", Style::new().fg(DIM)), inner);
+        return;
+    }
+    let height = inner.height as usize;
+    app.changes_pos.scroll(height);
+    let root_path = tree.path(app.view_root);
+    let mut lines = Vec::with_capacity(height);
+    for (i, c) in app
+        .changes
+        .iter()
+        .enumerate()
+        .skip(app.changes_pos.offset)
+        .take(height)
+    {
+        let (status, color, path, is_dir) = match (c.cur, c.base) {
+            (Some(id), None) => ("new", Color::Yellow, tree.path(id), tree.node(id).is_dir()),
+            (None, Some(b)) => (
+                "removed",
+                Color::Magenta,
+                diff.base.path(b),
+                diff.base.node(b).is_dir(),
+            ),
+            (Some(id), Some(_)) => (
+                if c.delta > 0 { "grew" } else { "shrank" },
+                if c.delta > 0 {
+                    Color::LightRed
+                } else {
+                    Color::LightGreen
+                },
+                tree.path(id),
+                false,
+            ),
+            (None, None) => continue,
+        };
+        let now = c
+            .cur
+            .map_or(String::new(), |id| fmt::size(metric(app, tree, id)));
+        let mut rel = path
+            .strip_prefix(&root_path)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        if is_dir {
+            rel.push('/');
+        }
+        let mut line = Line::from(vec![
+            Span::styled(
+                format!(" {:>9}", fmt::delta(c.delta)),
+                Style::new().fg(color),
+            ),
+            Span::styled(format!(" {:>9} ", now), Style::new().fg(DIM)),
+            Span::styled(format!("{status:<8}"), Style::new().fg(color)),
+            Span::raw(rel),
+        ]);
+        if i == app.changes_pos.sel {
+            line = line.style(Style::new().bg(SEL_BG));
+        }
+        lines.push(line);
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+    draw_scrollbar(f.buffer_mut(), inner, app.changes_pos, app.changes.len());
+}
+
+fn draw_confirm_delete(f: &mut Frame, app: &App, id: NodeId) {
+    let tree = app.tree.as_ref().unwrap();
+    let n = tree.node(id);
+    let what = if n.is_dir() {
+        let k = n.items - 1;
+        format!(
+            "this directory and its {} {}",
+            fmt::count(k),
+            if k == 1 { "entry" } else { "entries" }
+        )
+    } else {
+        "this file".to_string()
+    };
+    let lines = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::raw(tree.path(id).display().to_string()).bold(),
+        ]),
+        Line::raw(""),
+        Line::raw(format!(
+            "  Permanently delete {what} ({})?",
+            fmt::size(n.disk)
+        )),
+        Line::styled(
+            "  Symlinks are removed, not followed; other filesystems are left alone.",
+            Style::new().fg(DIM),
+        ),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(" y ", Style::new().fg(Color::Black).bg(Color::Red).bold()),
+            Span::raw(" delete    "),
+            Span::styled("any other key", Style::new().fg(ACCENT)),
+            Span::raw(" cancel"),
+        ]),
+    ];
+    let path_rows = (tree.path(id).as_os_str().len() as u16 + 2) / 76;
+    let area = centered(f.area(), 80, lines.len() as u16 + 2 + path_rows);
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Red))
+        .title(" delete ".bold());
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn draw_errors(f: &mut Frame, errors: &[String]) {
+    let mut lines: Vec<Line> = vec![
+        Line::raw("  Some entries could not be deleted:"),
+        Line::raw(""),
+    ];
+    for e in errors.iter().take(15) {
+        lines.push(Line::styled(format!("  {e}"), Style::new().fg(Color::Red)));
+    }
+    if errors.len() > 15 {
+        lines.push(Line::styled(
+            format!("  … and {} more", errors.len() - 15),
+            Style::new().fg(DIM),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  The parent directory is being rescanned. Press any key.",
+        Style::new().fg(DIM),
+    ));
+    let area = centered(f.area(), 100, lines.len() as u16 + 2);
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Red))
+        .title(" delete incomplete ".bold());
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }

@@ -1,4 +1,6 @@
 mod app;
+mod delete;
+mod diff;
 mod fmt;
 mod scan;
 mod snapshot;
@@ -48,6 +50,20 @@ struct Cli {
     #[arg(short = 'A', long)]
     apparent: bool,
 
+    /// Skip entries matching this glob (repeatable). Patterns without '/'
+    /// match names (e.g. 'node_modules', '*.o'); others match full paths
+    /// (e.g. '/home/*/.cache')
+    #[arg(short = 'e', long, value_name = "GLOB")]
+    exclude: Vec<String>,
+
+    /// Compare against this snapshot (shown in the Changes view and tree)
+    #[arg(short = 'd', long, value_name = "FILE")]
+    diff: Option<PathBuf>,
+
+    /// Disable deleting files from the UI
+    #[arg(long)]
+    no_delete: bool,
+
     /// Don't start the UI: scan (or refresh) and write the snapshot to --output
     #[arg(long, requires = "output")]
     no_ui: bool,
@@ -55,24 +71,30 @@ struct Cli {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let mut opts = ScanOptions {
-        one_file_system: cli.one_file_system,
-        threads: cli.threads.unwrap_or_else(scan::default_threads),
-    };
+    let mut one_file_system = cli.one_file_system;
+    let mut exclude = cli.exclude.clone();
 
     // Work out what to show: a snapshot, or a fresh scan of some root.
     let mut estimate = None;
-    let (meta, loaded) = match &cli.load {
+    let mut baseline = None;
+    let (mut meta, loaded) = match &cli.load {
         Some(file) => {
             let (entry, meta) = snapshot::load(file)?;
-            opts.one_file_system |= meta.one_file_system;
+            one_file_system |= meta.one_file_system;
+            for p in &meta.exclude {
+                if !exclude.contains(p) {
+                    exclude.push(p.clone());
+                }
+            }
             let entry = if cli.refresh {
-                // The old totals make a good estimate for the rescan.
+                // The old totals make a good estimate for the rescan, and
+                // the old tree is what we compare the new one against.
                 estimate = Some(scan::Estimate {
                     items: entry.items,
                     disk: entry.disk,
                     source: "previous scan",
                 });
+                baseline = Some((entry, meta.scanned_at));
                 None
             } else {
                 Some(entry)
@@ -84,12 +106,24 @@ fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("{}: {e}", cli.path.display()))?;
             let meta = Meta {
                 root,
-                one_file_system: opts.one_file_system,
+                one_file_system,
                 scanned_at: app::now_unix(),
                 scan_millis: 0,
+                exclude: Vec::new(),
             };
             (meta, None)
         }
+    };
+    if let Some(file) = &cli.diff {
+        let (entry, m) = snapshot::load(file)?;
+        baseline = Some((entry, m.scanned_at));
+    }
+    meta.one_file_system = one_file_system;
+    meta.exclude = exclude.clone();
+    let opts = ScanOptions {
+        one_file_system,
+        threads: cli.threads.unwrap_or_else(scan::default_threads),
+        exclude: std::sync::Arc::new(scan::Excludes::new(exclude)?),
     };
     let save_path = cli.output.clone().or_else(|| cli.load.clone());
 
@@ -99,6 +133,8 @@ fn main() -> anyhow::Result<()> {
 
     let mut app = App::new(meta, opts, !cli.apparent, save_path);
     app.initial_estimate = estimate;
+    app.allow_delete = !cli.no_delete;
+    app.pending_baseline = baseline;
     match loaded {
         Some(entry) => app.set_tree(entry),
         None => app.start_scan(None),
@@ -119,12 +155,18 @@ fn headless(
     let entry = match loaded {
         Some(e) => e,
         None => {
-            let estimate = estimate.or_else(|| scan::estimate_fs(&meta.root, opts.one_file_system));
+            let estimate = estimate.or_else(|| {
+                // Excluded entries would make a filesystem-wide estimate wrong.
+                opts.exclude
+                    .is_empty()
+                    .then(|| scan::estimate_fs(&meta.root, opts.one_file_system))
+                    .flatten()
+            });
             let progress = Progress::with_estimate(estimate);
             let t0 = Instant::now();
             let tty = std::io::stderr().is_terminal();
             let res = std::thread::scope(|s| {
-                let h = s.spawn(|| scan::scan(&meta.root, opts, &progress));
+                let h = s.spawn(|| scan::scan(&meta.root, opts.clone(), &progress));
                 let mut tick = 0u64;
                 while !h.is_finished() {
                     if tty && tick.is_multiple_of(10) {

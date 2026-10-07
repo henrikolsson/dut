@@ -6,6 +6,8 @@
 //! never re-walks full paths per file.
 
 use crate::tree::{Entry, Kind, flags};
+use anyhow::Context;
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -13,18 +15,60 @@ use std::fs::{self, DirEntry, Metadata};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Directories with more entries than this get their stat calls spread
 /// across workers instead of being handled by a single task.
 const PAR_STAT_THRESHOLD: usize = 4096;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ScanOptions {
     pub one_file_system: bool,
     pub threads: usize,
+    pub exclude: Arc<Excludes>,
+}
+
+/// Glob patterns for entries to skip entirely. Patterns without a `/` match
+/// the entry's name; patterns with one match its full path.
+#[derive(Debug, Default)]
+pub struct Excludes {
+    pub patterns: Vec<String>,
+    names: GlobSet,
+    paths: GlobSet,
+}
+
+impl Excludes {
+    pub fn new(patterns: Vec<String>) -> anyhow::Result<Excludes> {
+        let (mut names, mut paths) = (GlobSetBuilder::new(), GlobSetBuilder::new());
+        for p in &patterns {
+            let glob = GlobBuilder::new(p.trim_end_matches('/'))
+                .literal_separator(true)
+                .backslash_escape(true)
+                .build()
+                .with_context(|| format!("bad exclude pattern {p:?}"))?;
+            if p.trim_end_matches('/').contains('/') {
+                paths.add(glob);
+            } else {
+                names.add(glob);
+            }
+        }
+        Ok(Excludes {
+            patterns,
+            names: names.build()?,
+            paths: paths.build()?,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    fn matches(&self, dir: &Path, name: &OsStr) -> bool {
+        (!self.names.is_empty() && self.names.is_match(Path::new(name)))
+            || (!self.paths.is_empty() && self.paths.is_match(dir.join(name)))
+    }
 }
 
 #[derive(Default)]
@@ -156,6 +200,7 @@ pub fn default_threads() -> usize {
 pub fn scan(root: &Path, opts: ScanOptions, progress: &Progress) -> anyhow::Result<Entry> {
     let root = fs::canonicalize(root)?;
     let md = fs::symlink_metadata(&root)?;
+    let threads = opts.threads.max(1);
     let ctx = Ctx {
         root_dev: md.dev(),
         opts,
@@ -167,7 +212,7 @@ pub fn scan(root: &Path, opts: ScanOptions, progress: &Progress) -> anyhow::Resu
     progress.disk.fetch_add(entry.disk, Relaxed);
     if entry.kind == Kind::Dir {
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(opts.threads.max(1))
+            .num_threads(threads)
             .stack_size(16 << 20)
             .thread_name(|i| format!("dut-scan-{i}"))
             .build()?;
@@ -251,8 +296,10 @@ fn scan_dir(ctx: &Ctx, path: &Path, dir: &mut Entry) {
         }
     };
     let mut read_error = false;
+    let exclude = &ctx.opts.exclude;
     let des: Vec<DirEntry> = rd
         .filter_map(|r| r.map_err(|_| read_error = true).ok())
+        .filter(|de| exclude.is_empty() || !exclude.matches(path, &de.file_name()))
         .collect();
     if read_error {
         dir.flags |= flags::ERROR;

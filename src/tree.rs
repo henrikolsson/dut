@@ -218,6 +218,31 @@ impl Tree {
         new
     }
 
+    /// Detaches the subtree at `id` (after it was deleted from disk),
+    /// subtracting its sizes from all ancestors.
+    pub fn remove(&mut self, id: NodeId, sort: SortKey) {
+        let (parent, size, disk, items) = {
+            let n = self.node(id);
+            (n.parent, n.size, n.disk, n.items)
+        };
+        if parent == NO_PARENT {
+            return;
+        }
+        let siblings = &mut self.nodes[parent as usize].children;
+        *siblings = siblings.iter().copied().filter(|&c| c != id).collect();
+        self.garbage += items as usize;
+        let mut p = parent;
+        while p != NO_PARENT {
+            let n = &mut self.nodes[p as usize];
+            n.size -= size;
+            n.disk -= disk;
+            n.items -= items;
+            let next = n.parent;
+            self.sort_children_of(p, sort);
+            p = next;
+        }
+    }
+
     /// Full filesystem path of a node.
     pub fn path(&self, id: NodeId) -> PathBuf {
         use std::os::unix::ffi::OsStrExt;

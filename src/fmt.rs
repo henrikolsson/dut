@@ -18,6 +18,11 @@ pub fn size(bytes: u64) -> String {
     }
 }
 
+pub fn delta(d: i64) -> String {
+    let sign = if d < 0 { '-' } else { '+' };
+    format!("{sign}{}", size(d.unsigned_abs()))
+}
+
 pub fn count(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);

@@ -1,3 +1,4 @@
+use crate::diff::{ChangeItem, Diff, Summary};
 use crate::scan::{self, Estimate, Progress, ScanOptions};
 use crate::snapshot::{self, Meta};
 use crate::tree::{Entry, Kind, NO_PARENT, NodeId, SortKey, Tree, flags};
@@ -5,6 +6,7 @@ use crate::treemap::Rect;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -18,10 +20,17 @@ pub enum View {
     Treemap,
     Files,
     Types,
+    Changes,
 }
 
 impl View {
-    pub const ALL: [View; 4] = [View::Tree, View::Treemap, View::Files, View::Types];
+    pub const ALL: [View; 5] = [
+        View::Tree,
+        View::Treemap,
+        View::Files,
+        View::Types,
+        View::Changes,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -29,6 +38,7 @@ impl View {
             View::Treemap => "Treemap",
             View::Files => "Largest files",
             View::Types => "File types",
+            View::Changes => "Changes",
         }
     }
 }
@@ -77,19 +87,34 @@ pub struct TypeStat {
     pub count: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum JobKind {
+    Scan,
+    Delete,
+}
+
+enum JobResult {
+    Scan(anyhow::Result<Entry>),
+    Delete(Vec<String>),
+}
+
 pub struct Job {
-    /// Node being refreshed, or `None` for the full tree / initial scan.
+    pub kind: JobKind,
+    /// Node being refreshed/deleted, or `None` for the full tree / initial scan.
     pub target: Option<NodeId>,
     pub path: PathBuf,
     pub progress: Arc<Progress>,
     pub started: Instant,
-    rx: Receiver<anyhow::Result<Entry>>,
+    rx: Receiver<JobResult>,
 }
 
 pub enum Mode {
     Normal,
     Help,
     SavePrompt(String),
+    ConfirmDelete(NodeId),
+    /// Problems from a delete that did not fully succeed.
+    Errors(Vec<String>),
 }
 
 pub struct App {
@@ -108,6 +133,12 @@ pub struct App {
     pub generation: u64,
     /// Totals from a loaded snapshot, used as the estimate for its rescan.
     pub initial_estimate: Option<Estimate>,
+    /// Bumped when nodes are added/removed (not on re-sorts).
+    pub structure_gen: u64,
+    pub allow_delete: bool,
+    pub diff: Option<Diff>,
+    /// Baseline to compare against once the initial scan completes.
+    pub pending_baseline: Option<(Entry, u64)>,
 
     // Tree view
     pub expanded: HashSet<NodeId>,
@@ -130,6 +161,12 @@ pub struct App {
     pub types: Vec<TypeStat>,
     pub types_pos: ListPos,
     types_key: Option<(u64, NodeId, bool)>,
+
+    // Changes view
+    pub changes: Vec<ChangeItem>,
+    pub changes_sum: Summary,
+    pub changes_pos: ListPos,
+    changes_key: Option<(u64, NodeId, bool)>,
 
     quit: bool,
 }
@@ -160,6 +197,10 @@ impl App {
             save_path,
             generation: 0,
             initial_estimate: None,
+            structure_gen: 0,
+            allow_delete: true,
+            diff: None,
+            pending_baseline: None,
             expanded: HashSet::new(),
             rows: Vec::new(),
             rows_dirty: true,
@@ -174,6 +215,10 @@ impl App {
             types: Vec::new(),
             types_pos: ListPos::default(),
             types_key: None,
+            changes: Vec::new(),
+            changes_sum: Summary::default(),
+            changes_pos: ListPos::default(),
+            changes_key: None,
             quit: false,
         }
     }
@@ -183,7 +228,27 @@ impl App {
         self.view_root = tree.root;
         self.tree = Some(tree);
         self.generation += 1;
+        self.structure_gen += 1;
         self.rows_dirty = true;
+        if let Some((base, time)) = self.pending_baseline.take() {
+            self.set_baseline(Diff::new(base, time));
+        }
+    }
+
+    pub fn set_baseline(&mut self, diff: Diff) {
+        self.diff = Some(diff);
+        self.ensure_diff();
+        if !self.diff.as_ref().unwrap().overlaps() {
+            self.diff = None;
+            self.flash("snapshot to compare with does not overlap the scanned path");
+        }
+        self.generation += 1;
+    }
+
+    pub fn ensure_diff(&mut self) {
+        if let (Some(d), Some(t)) = (&mut self.diff, &self.tree) {
+            d.sync(t, self.structure_gen);
+        }
     }
 
     pub fn flash(&mut self, msg: impl Into<String>) {
@@ -210,21 +275,26 @@ impl App {
                     source: "previous scan",
                 })
             }
-            _ => self
-                .initial_estimate
-                .take()
-                .or_else(|| scan::estimate_fs(&path, self.opts.one_file_system)),
+            _ => self.initial_estimate.take().or_else(|| {
+                // Excluded entries would make a filesystem-wide estimate wrong.
+                self.opts
+                    .exclude
+                    .is_empty()
+                    .then(|| scan::estimate_fs(&path, self.opts.one_file_system))
+                    .flatten()
+            }),
         };
         let progress = Arc::new(Progress::with_estimate(estimate));
         let (tx, rx) = std::sync::mpsc::channel();
-        let (p, opts, scan_path) = (progress.clone(), self.opts, path.clone());
+        let (p, opts, scan_path) = (progress.clone(), self.opts.clone(), path.clone());
         std::thread::Builder::new()
             .name("dut-scan".into())
             .spawn(move || {
-                let _ = tx.send(scan::scan(&scan_path, opts, &p));
+                let _ = tx.send(JobResult::Scan(scan::scan(&scan_path, opts, &p)));
             })
             .expect("spawning scan thread");
         self.job = Some(Job {
+            kind: JobKind::Scan,
             target,
             path,
             progress,
@@ -238,9 +308,15 @@ impl App {
         let res = match job.rx.try_recv() {
             Ok(r) => r,
             Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!("scan thread died")),
+            Err(TryRecvError::Disconnected) => {
+                JobResult::Scan(Err(anyhow::anyhow!("background thread died")))
+            }
         };
         let job = self.job.take().unwrap();
+        let res = match res {
+            JobResult::Scan(r) => r,
+            JobResult::Delete(errors) => return self.finish_delete(job, errors),
+        };
         if job
             .progress
             .cancel
@@ -301,7 +377,24 @@ impl App {
         let cursor_chain = cursor.map(chain);
         let expanded: Vec<_> = self.expanded.iter().map(|&id| chain(id)).collect();
 
-        tree.replace(target.unwrap_or(root), entry, sort);
+        let target_id = target.unwrap_or(root);
+        // Keep what was there as the baseline for the changes view, unless
+        // an existing baseline already covers this path.
+        let target_path = tree.path(target_id);
+        if !self.diff.as_ref().is_some_and(|d| d.covers(&target_path)) {
+            let time = self.meta.scanned_at;
+            self.diff = Some(if target.is_none() {
+                let old = std::mem::replace(tree, Tree::from_entry(entry, sort));
+                Diff::from_tree(old, time)
+            } else {
+                let mut old = tree.to_entry(target_id);
+                old.name = target_path.as_os_str().as_bytes().into();
+                tree.replace(target_id, entry, sort);
+                Diff::new(old, time)
+            });
+        } else {
+            tree.replace(target_id, entry, sort);
+        }
         if tree.garbage > tree.nodes.len() / 2 {
             // Too much dead weight from refreshes; rebuild the arena.
             let e = tree.to_entry(tree.root);
@@ -316,6 +409,7 @@ impl App {
             .collect();
         let cursor = cursor_chain.map(|c| tree.resolve_chain(root, &c));
         self.generation += 1;
+        self.structure_gen += 1;
         self.rebuild_rows();
         if let Some(c) = cursor {
             self.select_id(c);
@@ -364,6 +458,123 @@ impl App {
             View::Treemap => self.tm_rects.get(self.tm_sel).map(|r| r.0),
             View::Files => self.files.get(self.files_pos.sel).copied(),
             View::Types => None,
+            View::Changes => self.changes.get(self.changes_pos.sel).and_then(|c| c.cur),
+        }
+    }
+
+    /// Deepest node along `path` in the current tree.
+    fn find_path(&self, path: &std::path::Path) -> Option<NodeId> {
+        let tree = self.tree.as_ref()?;
+        let rel = path.strip_prefix(tree.path(tree.root)).ok()?;
+        let chain: Vec<Box<[u8]>> = rel.iter().map(|c| c.as_bytes().into()).collect();
+        Some(tree.resolve_chain(tree.root, &chain))
+    }
+
+    fn reveal_change(&mut self) {
+        let Some(item) = self.changes.get(self.changes_pos.sel) else {
+            return;
+        };
+        let id = match (item.cur, item.base, &self.diff) {
+            (Some(c), _, _) => Some(c),
+            (None, Some(b), Some(d)) => self.find_path(&d.base.path(b)),
+            _ => None,
+        };
+        let removed = item.cur.is_none();
+        if let Some(id) = id {
+            self.reveal(id);
+            if removed {
+                self.flash("removed entry; showing where it was");
+            }
+        }
+    }
+
+    pub fn ensure_changes(&mut self) {
+        self.ensure_diff();
+        let key = (self.structure_gen, self.view_root, self.use_disk);
+        if self.changes_key == Some(key) {
+            return;
+        }
+        self.changes_key = Some(key);
+        self.changes_pos = ListPos::default();
+        let (Some(d), Some(t)) = (&self.diff, &self.tree) else {
+            self.changes.clear();
+            return;
+        };
+        (self.changes, self.changes_sum) = d.changes(t, self.view_root, self.use_disk, TOP_FILES);
+    }
+
+    // ---- deletion ----------------------------------------------------------
+
+    fn ask_delete(&mut self) {
+        if !self.allow_delete {
+            return self.flash("deleting is disabled (--no-delete)");
+        }
+        let Some(id) = self.selected() else { return };
+        let tree = self.tree.as_ref().unwrap();
+        if id == tree.root || id == self.view_root {
+            return self.flash("can't delete the directory being viewed; go up first");
+        }
+        if self.job.is_some() {
+            return self.flash("wait for the running job to finish");
+        }
+        self.mode = Mode::ConfirmDelete(id);
+    }
+
+    fn start_delete(&mut self, id: NodeId) {
+        let tree = self.tree.as_ref().unwrap();
+        let path = tree.path(id);
+        let progress = Arc::new(Progress::with_estimate(Some(Estimate {
+            items: tree.node(id).items,
+            disk: 0,
+            source: "scan",
+        })));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (p, del_path) = (progress.clone(), path.clone());
+        std::thread::Builder::new()
+            .name("dut-delete".into())
+            .spawn(move || {
+                let _ = tx.send(JobResult::Delete(crate::delete::delete(&del_path, &p)));
+            })
+            .expect("spawning delete thread");
+        self.job = Some(Job {
+            kind: JobKind::Delete,
+            target: Some(id),
+            path,
+            progress,
+            started: Instant::now(),
+            rx,
+        });
+    }
+
+    fn finish_delete(&mut self, job: Job, errors: Vec<String>) {
+        let id = job.target.unwrap();
+        let freed = job.progress.disk.load(std::sync::atomic::Ordering::Relaxed);
+        if errors.is_empty() && !job.path.exists() {
+            let sort = self.sort;
+            let tree = self.tree.as_mut().unwrap();
+            let parent = tree.node(id).parent;
+            tree.remove(id, sort);
+            self.expanded.remove(&id);
+            self.generation += 1;
+            self.structure_gen += 1;
+            self.rebuild_rows();
+            if self.view == View::Tree && self.rows.get(self.tree_pos.sel).is_none() {
+                self.select_id(parent);
+            }
+            self.flash(format!(
+                "deleted {} ({} freed)",
+                job.path.display(),
+                crate::fmt::size(freed)
+            ));
+        } else {
+            // Partially deleted: rescan the parent so the tree matches disk.
+            let parent = self.tree.as_ref().unwrap().node(id).parent;
+            if errors.is_empty() {
+                self.flash("delete cancelled; rescanning");
+            } else {
+                self.mode = Mode::Errors(errors);
+            }
+            self.start_scan(Some(parent));
         }
     }
 
@@ -617,6 +828,7 @@ impl App {
             Which::Tree => (&mut self.tree_pos, self.rows.len()),
             Which::Files => (&mut self.files_pos, self.files.len()),
             Which::Types => (&mut self.types_pos, self.types.len()),
+            Which::Changes => (&mut self.changes_pos, self.changes.len()),
         };
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => pos.move_by(1, len),
@@ -670,6 +882,20 @@ impl App {
                 }
                 return;
             }
+            Mode::ConfirmDelete(id) => {
+                let id = *id;
+                self.mode = Mode::Normal;
+                if key.code == KeyCode::Char('y') {
+                    self.start_delete(id);
+                } else {
+                    self.flash("delete cancelled");
+                }
+                return;
+            }
+            Mode::Errors(_) => {
+                self.mode = Mode::Normal;
+                return;
+            }
             Mode::Normal => {}
         }
 
@@ -710,6 +936,8 @@ impl App {
             KeyCode::Char('2') => self.view = View::Treemap,
             KeyCode::Char('3') => self.view = View::Files,
             KeyCode::Char('4') => self.view = View::Types,
+            KeyCode::Char('5') => self.view = View::Changes,
+            KeyCode::Char('d') | KeyCode::Delete if !ctrl => self.ask_delete(),
             KeyCode::Char('v') => {
                 let i = View::ALL.iter().position(|&v| v == self.view).unwrap();
                 self.view = View::ALL[(i + 1) % View::ALL.len()];
@@ -775,6 +1003,10 @@ impl App {
                         }
                     }
                     _ => self.list_nav(key, page, Which::Types),
+                },
+                View::Changes => match key.code {
+                    KeyCode::Enter => self.reveal_change(),
+                    _ => self.list_nav(key, page, Which::Changes),
                 },
             },
         }
@@ -859,6 +1091,7 @@ enum Which {
     Tree,
     Files,
     Types,
+    Changes,
 }
 
 fn push_rows(

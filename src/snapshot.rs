@@ -11,7 +11,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"DUTSNAP\0";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 pub struct Meta {
     pub root: PathBuf,
@@ -19,6 +19,8 @@ pub struct Meta {
     /// Unix timestamp (seconds) of when the scan finished.
     pub scanned_at: u64,
     pub scan_millis: u64,
+    /// Exclude patterns the scan was made with.
+    pub exclude: Vec<String>,
 }
 
 fn put_varint(w: &mut impl Write, mut v: u64) -> std::io::Result<()> {
@@ -78,6 +80,10 @@ pub fn save(path: &Path, tree: &Tree, meta: &Meta) -> anyhow::Result<()> {
     z.write_all(&[meta.one_file_system as u8])?;
     put_varint(&mut z, meta.scanned_at)?;
     put_varint(&mut z, meta.scan_millis)?;
+    put_varint(&mut z, meta.exclude.len() as u64)?;
+    for p in &meta.exclude {
+        put_bytes(&mut z, p.as_bytes())?;
+    }
     put_varint(&mut z, tree.root_node().items)?;
 
     let mut stack: Vec<NodeId> = vec![tree.root];
@@ -116,7 +122,7 @@ pub fn load(path: &Path) -> anyhow::Result<(Entry, Meta)> {
     let mut ver = [0u8; 4];
     r.read_exact(&mut ver)?;
     let ver = u32::from_le_bytes(ver);
-    if ver != VERSION {
+    if !(1..=VERSION).contains(&ver) {
         bail!("unsupported snapshot version {ver}");
     }
     let mut z = BufReader::with_capacity(1 << 16, lz4_flex::frame::FrameDecoder::new(r));
@@ -124,12 +130,19 @@ pub fn load(path: &Path) -> anyhow::Result<(Entry, Meta)> {
     let root = PathBuf::from(std::ffi::OsStr::from_bytes(&root));
     let mut b = [0u8];
     z.read_exact(&mut b)?;
-    let meta = Meta {
+    let mut meta = Meta {
         root,
         one_file_system: b[0] != 0,
         scanned_at: get_varint(&mut z)?,
         scan_millis: get_varint(&mut z)?,
+        exclude: Vec::new(),
     };
+    if ver >= 2 {
+        for _ in 0..get_varint(&mut z)? {
+            let p = get_bytes(&mut z)?;
+            meta.exclude.push(String::from_utf8_lossy(&p).into_owned());
+        }
+    }
     let _count = get_varint(&mut z)?;
 
     // Preorder rebuild: a stack of open directories with remaining child counts.
@@ -180,22 +193,29 @@ pub fn load(path: &Path) -> anyhow::Result<(Entry, Meta)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::{Progress, ScanOptions, scan};
+    use crate::scan::{Excludes, Progress, ScanOptions, scan};
     use crate::tree::SortKey;
+    use std::sync::Arc;
 
     #[test]
     fn roundtrip() {
         let dir = std::env::temp_dir().join(format!("dut-test-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::create_dir_all(dir.join("a/skipdir")).unwrap();
+        std::fs::write(dir.join("a/skipdir/big"), vec![1u8; 100_000]).unwrap();
         std::fs::write(dir.join("a/b/f"), vec![1u8; 10_000]).unwrap();
+        std::fs::write(dir.join("a/b/f.tmp"), vec![1u8; 10_000]).unwrap();
         std::fs::write(dir.join("g"), b"hi").unwrap();
         std::fs::hard_link(dir.join("g"), dir.join("a/g2")).unwrap();
+        let exclude = vec!["*.tmp".to_string(), "**/a/skipdir".to_string()];
         let opts = ScanOptions {
             one_file_system: true,
             threads: 2,
+            exclude: Arc::new(Excludes::new(exclude.clone()).unwrap()),
         };
         let e = scan(&dir, opts, &Progress::default()).unwrap();
         let (items, size, disk) = (e.items, e.size, e.disk);
+        // root, a, a/b, a/b/f, a/g2, g
         assert_eq!(items, 6);
         let tree = Tree::from_entry(e, SortKey::Disk);
         let meta = Meta {
@@ -203,6 +223,7 @@ mod tests {
             one_file_system: true,
             scanned_at: 42,
             scan_millis: 7,
+            exclude: exclude.clone(),
         };
         let file = dir.with_extension("dut");
         save(&file, &tree, &meta).unwrap();
@@ -212,6 +233,7 @@ mod tests {
             (m2.root, m2.scanned_at, m2.scan_millis),
             (dir.clone(), 42, 7)
         );
+        assert_eq!(m2.exclude, exclude);
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_file(&file).unwrap();
     }
