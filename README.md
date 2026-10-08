@@ -59,7 +59,8 @@ Prebuilt binaries for Linux (static, x86_64 and arm64) and macOS (Apple
 silicon and Intel) are on the [releases page](https://github.com/henrikolsson/dut/releases).
 
 ```sh
-# Nix
+# Nix (binaries come from dut.cachix.org; `cachix use dut` to trust it)
+nix run github:henrikolsson/dut
 nix run .            # or: nix profile install .
 
 # Cargo (Linux, macOS)

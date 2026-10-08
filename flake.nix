@@ -1,5 +1,11 @@
 {
   description = "dut - fast TUI disk usage analyzer";
+  # Prebuilt outputs from CI. Nix asks before trusting these unless you're a
+  # trusted user or accept-flake-config is set.
+  nixConfig = {
+    extra-substituters = [ "https://dut.cachix.org" ];
+    extra-trusted-public-keys = [ "dut.cachix.org-1:7ztziGz6lkWtRGVps9uqE+0HGD3z+A1TymVxbd7wnLY=" ];
+  };
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
