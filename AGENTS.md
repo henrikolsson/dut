@@ -64,6 +64,10 @@ the Linux side with
 
 ## Releases
 
+`scripts/release.sh <version>` bumps `Cargo.toml` and `Cargo.lock`, runs
+fmt, clippy and tests, commits `chore: release v<version>`, tags, and asks
+before pushing. Use it instead of tagging by hand.
+
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and the Nix build
 on Linux and macOS, and pushes Nix outputs to the `dut` Cachix cache.
 Pushing a `v*` tag runs `release.yml`, which publishes static Linux and

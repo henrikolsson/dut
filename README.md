@@ -158,7 +158,9 @@ cargo build --release
 ```
 
 CI runs fmt, clippy and the tests on Linux and macOS, plus the Nix build.
-Pushing a `v*` tag builds release binaries and publishes a GitHub release.
+To release, run `scripts/release.sh 0.2.0` on an up-to-date `main`. It
+bumps the version, runs the checks, commits, tags, and asks before
+pushing. The pushed tag builds binaries and publishes a GitHub release.
 
 The demo is reproducible: `demo/make-demo.sh` builds a fake home directory
 with backdated snapshots, and `demo/record.sh` records the GIF and
