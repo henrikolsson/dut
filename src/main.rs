@@ -23,9 +23,9 @@ use std::time::{Duration, Instant};
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Directory to scan
-    #[arg(default_value = ".", conflicts_with = "load")]
-    path: PathBuf,
+    /// Directory to scan [default: .]
+    #[arg(conflicts_with = "load")]
+    path: Option<PathBuf>,
 
     /// Open a saved snapshot instead of scanning
     #[arg(short = 'f', long, value_name = "FILE")]
@@ -77,110 +77,131 @@ struct Cli {
     /// Open the automatic snapshot without rescanning
     #[arg(short = 'c', long, conflicts_with_all = ["no_cache", "load"])]
     cached: bool,
+
+    /// List the automatic snapshots and exit
+    #[arg(long)]
+    cache_list: bool,
+
+    /// Delete the automatic snapshots of PATH (or all of them) and exit
+    #[arg(long)]
+    clear_cache: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.cache_list {
+        return cache_list();
+    }
+    if cli.clear_cache {
+        let root = cli.path.as_deref().map(std::fs::canonicalize).transpose()?;
+        let (n, bytes) = cache::clear(root.as_deref());
+        eprintln!("removed {n} snapshots ({})", fmt::size(bytes));
+        return Ok(());
+    }
+
+    let sort = if cli.apparent {
+        tree::SortKey::Size
+    } else {
+        tree::SortKey::Disk
+    };
     let mut one_file_system = cli.one_file_system;
     let mut exclude = cli.exclude.clone();
 
-    // Work out what to show: a snapshot, or a fresh scan of some root.
-    let mut estimate = None;
+    // What to show first: an explicit snapshot, a cached one, or a fresh scan.
+    let mut loaded: Option<tree::Tree> = None;
     let mut baseline = None;
-    let (mut meta, loaded) = match &cli.load {
+    let mut meta = match &cli.load {
         Some(file) => {
-            let (entry, meta) = snapshot::load(file)?;
+            let (tree, meta) = snapshot::load(file, sort)?;
             one_file_system |= meta.one_file_system;
             for p in &meta.exclude {
                 if !exclude.contains(p) {
                     exclude.push(p.clone());
                 }
             }
-            let entry = if cli.refresh {
-                // The old totals make a good estimate for the rescan, and
-                // the old tree is what we compare the new one against.
-                estimate = Some(scan::Estimate {
-                    items: entry.items,
-                    disk: entry.disk,
-                    source: "previous scan",
-                });
-                baseline = Some((entry, meta.scanned_at));
-                None
+            if cli.refresh {
+                // The old tree is what the rescan gets compared against.
+                baseline = Some((tree, meta.scanned_at));
             } else {
-                Some(entry)
-            };
-            (meta, entry)
+                loaded = Some(tree);
+            }
+            meta
         }
         None => {
-            let root = std::fs::canonicalize(&cli.path)
-                .map_err(|e| anyhow::anyhow!("{}: {e}", cli.path.display()))?;
-            let meta = Meta {
-                root,
+            let path = cli.path.clone().unwrap_or_else(|| PathBuf::from("."));
+            Meta {
+                root: std::fs::canonicalize(&path)
+                    .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?,
                 one_file_system,
                 scanned_at: app::now_unix(),
                 scan_millis: 0,
                 exclude: Vec::new(),
-            };
-            (meta, None)
+            }
         }
     };
     if let Some(file) = &cli.diff {
-        let (entry, m) = snapshot::load(file)?;
-        baseline = Some((entry, m.scanned_at));
+        let (tree, m) = snapshot::load(file, tree::SortKey::Name)?;
+        baseline = Some((tree, m.scanned_at));
     }
     meta.one_file_system = one_file_system;
     meta.exclude = exclude.clone();
     let opts = ScanOptions {
         one_file_system,
         threads: cli.threads.unwrap_or_else(scan::default_threads),
-        exclude: std::sync::Arc::new(scan::Excludes::new(exclude)?),
+        exclude: std::sync::Arc::new(scan::Excludes::new(exclude.clone())?),
     };
-    let save_path = cli.output.clone().or_else(|| cli.load.clone());
-    let cache_path = if cli.no_cache {
-        None
-    } else {
-        cache::path_for(&meta.root, meta.one_file_system, &meta.exclude)
-    };
+    let use_cache = !cli.no_cache && cache::dir().is_some();
 
     if cli.no_ui {
-        let outs: Vec<PathBuf> = cli.output.iter().chain(&cache_path).cloned().collect();
-        if outs.is_empty() {
+        if cli.output.is_none() && !use_cache {
             bail!("--no-ui needs --output, or the cache enabled");
         }
-        return headless(meta, loaded, estimate, opts, outs);
+        let estimate = baseline.as_ref().map(|(t, _)| estimate_from(t));
+        return headless(meta, loaded, estimate, opts, cli.output.clone(), use_cache);
     }
 
-    // Without an explicit snapshot, start from the automatic one if present:
-    // show it right away, refresh in the background, then compare.
-    let mut stale = false;
-    let mut loaded = loaded;
-    if cli.load.is_none() {
-        let cached = cache_path
-            .as_deref()
-            .filter(|p| p.exists())
-            .and_then(|p| snapshot::load(p).ok());
+    // Without an explicit snapshot, start from the cached one if there is
+    // one: show it right away, refresh in the background, then compare.
+    // Failing that, a cached ancestor's subtree will do.
+    let mut stale_source = None;
+    if cli.load.is_none() && use_cache {
+        let own = cache::Key::of(&meta)
+            .latest()
+            .and_then(|p| snapshot::load(&p, sort).ok());
+        let cached = own.or_else(|| {
+            let (file, m) = cache::find_ancestor(&meta.root, one_file_system, &exclude)?;
+            let sub = snapshot::load_tree(&file, sort, Some(&meta.root), None).ok()?;
+            stale_source = Some(m.root);
+            Some(sub)
+        });
         match cached {
-            Some((entry, m)) => {
+            Some((tree, m)) => {
                 meta.scanned_at = m.scanned_at;
                 meta.scan_millis = m.scan_millis;
-                loaded = Some(entry);
-                stale = !cli.cached;
+                loaded = Some(tree);
             }
             None if cli.cached => bail!("no cached snapshot for {}", meta.root.display()),
             None => {}
         }
     }
+    let stale = cli.load.is_none() && loaded.is_some() && !cli.cached;
 
+    let save_path = cli.output.clone().or_else(|| cli.load.clone());
     let mut app = App::new(meta, opts, !cli.apparent, save_path);
-    app.initial_estimate = estimate;
     app.allow_delete = !cli.no_delete;
-    app.pending_baseline = baseline;
-    app.cache_path = cache_path;
+    app.use_cache = use_cache;
+    if let Some((t, time)) = baseline {
+        if loaded.is_none() {
+            app.initial_estimate = Some(estimate_from(&t));
+        }
+        app.pending_baseline = Some((t, time));
+    }
     match loaded {
-        Some(entry) => {
-            app.set_tree(entry);
+        Some(tree) => {
+            app.set_tree(tree);
             if stale {
                 app.stale = true;
+                app.stale_source = stale_source;
                 app.start_scan(None);
             }
         }
@@ -192,23 +213,76 @@ fn main() -> anyhow::Result<()> {
     res
 }
 
+fn estimate_from(t: &tree::Tree) -> scan::Estimate {
+    let r = t.root_node();
+    scan::Estimate {
+        items: r.items,
+        disk: r.disk,
+        source: "previous scan",
+    }
+}
+
+fn cache_list() -> anyhow::Result<()> {
+    let list = cache::list();
+    if list.is_empty() {
+        eprintln!(
+            "no cached snapshots in {}",
+            cache::dir().unwrap_or_default().display()
+        );
+        return Ok(());
+    }
+    let mut total = 0;
+    for l in &list {
+        total += l.bytes;
+        let mut opts = String::new();
+        if l.meta.one_file_system {
+            opts += " -x";
+        }
+        for e in &l.meta.exclude {
+            opts += &format!(" -e {e}");
+        }
+        println!(
+            "{:>9}  {:>9}  {}{}",
+            fmt::ago(l.meta.scanned_at),
+            fmt::size(l.bytes),
+            l.meta.root.display(),
+            opts
+        );
+    }
+    println!(
+        "{} snapshots, {} in {}",
+        list.len(),
+        fmt::size(total),
+        cache::dir().unwrap_or_default().display()
+    );
+    Ok(())
+}
+
 fn headless(
     mut meta: Meta,
-    loaded: Option<tree::Entry>,
+    loaded: Option<tree::Tree>,
     estimate: Option<scan::Estimate>,
     opts: ScanOptions,
-    outs: Vec<PathBuf>,
+    output: Option<PathBuf>,
+    use_cache: bool,
 ) -> anyhow::Result<()> {
-    let entry = match loaded {
-        Some(e) => e,
+    let tree = match loaded {
+        Some(t) => t,
         None => {
-            let estimate = estimate.or_else(|| {
-                // Excluded entries would make a filesystem-wide estimate wrong.
-                opts.exclude
-                    .is_empty()
-                    .then(|| scan::estimate_fs(&meta.root, opts.one_file_system))
-                    .flatten()
-            });
+            let estimate = estimate
+                .or_else(|| {
+                    let own = cache::Key::of(&meta).latest()?;
+                    let (t, _) =
+                        snapshot::load_tree(&own, tree::SortKey::Name, None, Some(0)).ok()?;
+                    Some(estimate_from(&t))
+                })
+                .or_else(|| {
+                    // Excluded entries would make a filesystem-wide estimate wrong.
+                    opts.exclude
+                        .is_empty()
+                        .then(|| scan::estimate_fs(&meta.root, opts.one_file_system))
+                        .flatten()
+                });
             let progress = Progress::with_estimate(estimate);
             let t0 = Instant::now();
             let tty = std::io::stderr().is_terminal();
@@ -261,17 +335,16 @@ fn headless(
                     String::new()
                 }
             );
-            e
+            tree::Tree::from_entry(e, tree::SortKey::Disk)
         }
     };
-    if entry.items == 0 {
-        bail!("nothing scanned");
-    }
-    let tree = tree::Tree::from_entry(entry, tree::SortKey::Disk);
-    for out in outs {
-        cache::ensure_dir(&out)?;
+    if let Some(out) = output {
         snapshot::save(&out, &tree, &meta)?;
         eprintln!("saved {}", out.display());
+    }
+    if use_cache {
+        let path = cache::save(&tree, &meta)?;
+        eprintln!("cached {}", path.display());
     }
     Ok(())
 }

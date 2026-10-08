@@ -22,15 +22,17 @@ pub enum View {
     Files,
     Types,
     Changes,
+    History,
 }
 
 impl View {
-    pub const ALL: [View; 5] = [
+    pub const ALL: [View; 6] = [
         View::Tree,
         View::Treemap,
         View::Files,
         View::Types,
         View::Changes,
+        View::History,
     ];
 
     pub fn title(self) -> &'static str {
@@ -40,6 +42,7 @@ impl View {
             View::Files => "Largest files",
             View::Types => "File types",
             View::Changes => "Changes",
+            View::History => "History",
         }
     }
 }
@@ -109,6 +112,36 @@ struct FullScan {
     cache_err: Option<anyhow::Error>,
 }
 
+/// Size of the viewed directory in one snapshot of the history.
+pub struct HistPoint {
+    pub time: u64,
+    /// `None` for the tree currently loaded.
+    pub file: Option<PathBuf>,
+    /// `None` if the directory did not exist in that snapshot.
+    pub totals: Option<(u64, u64, u64)>,
+    /// Immediate children: (name, size, disk).
+    pub children: Vec<(Box<[u8]>, u64, u64)>,
+}
+
+impl HistPoint {
+    fn from_tree(tree: &Tree, id: NodeId, time: u64, file: Option<PathBuf>) -> HistPoint {
+        let n = tree.node(id);
+        HistPoint {
+            time,
+            file,
+            totals: Some((n.size, n.disk, n.items)),
+            children: n
+                .children
+                .iter()
+                .map(|&c| {
+                    let c = tree.node(c);
+                    (c.name.clone(), c.size, c.disk)
+                })
+                .collect(),
+        }
+    }
+}
+
 struct ViewState {
     view_root: Vec<Box<[u8]>>,
     cursor: Option<Vec<Box<[u8]>>>,
@@ -155,9 +188,11 @@ pub struct App {
     pub allow_delete: bool,
     pub diff: Option<Diff>,
     /// Baseline to compare against once the initial scan completes.
-    pub pending_baseline: Option<(Entry, u64)>,
-    /// Where full scans are automatically saved, unless disabled.
-    pub cache_path: Option<PathBuf>,
+    pub pending_baseline: Option<(Tree, u64)>,
+    /// Whether full scans are automatically saved to the cache.
+    pub use_cache: bool,
+    /// Where the stale tree came from, if not this root's own snapshot.
+    pub stale_source: Option<PathBuf>,
     /// The tree changed (subtree refresh, delete) since the cache was written.
     pub cache_dirty: bool,
     cache_err: Option<anyhow::Error>,
@@ -185,6 +220,12 @@ pub struct App {
     pub types: Vec<TypeStat>,
     pub types_pos: ListPos,
     types_key: Option<(u64, NodeId, bool)>,
+
+    // History view
+    pub history: Vec<HistPoint>,
+    pub history_pos: ListPos,
+    history_key: Option<(u64, NodeId)>,
+    history_rx: Option<Receiver<HistPoint>>,
 
     // Changes view
     pub changes: Vec<ChangeItem>,
@@ -225,7 +266,8 @@ impl App {
             allow_delete: true,
             diff: None,
             pending_baseline: None,
-            cache_path: None,
+            use_cache: false,
+            stale_source: None,
             cache_dirty: false,
             cache_err: None,
             stale: false,
@@ -243,6 +285,10 @@ impl App {
             types: Vec::new(),
             types_pos: ListPos::default(),
             types_key: None,
+            history: Vec::new(),
+            history_pos: ListPos::default(),
+            history_key: None,
+            history_rx: None,
             changes: Vec::new(),
             changes_sum: Summary::default(),
             changes_pos: ListPos::default(),
@@ -251,23 +297,20 @@ impl App {
         }
     }
 
-    pub fn set_tree(&mut self, entry: Entry) {
-        self.set_built_tree(Tree::from_entry(entry, self.sort));
-    }
-
-    fn set_built_tree(&mut self, tree: Tree) {
+    pub fn set_tree(&mut self, tree: Tree) {
         self.view_root = tree.root;
         self.tree = Some(tree);
         self.generation += 1;
         self.structure_gen += 1;
         self.rows_dirty = true;
         if let Some((base, time)) = self.pending_baseline.take() {
-            self.set_baseline(Diff::new(base, time));
+            self.set_baseline(Diff::from_tree(base, time));
         }
     }
 
     pub fn set_baseline(&mut self, diff: Diff) {
         self.diff = Some(diff);
+        self.changes_key = None;
         self.ensure_diff();
         if !self.diff.as_ref().unwrap().overlaps() {
             self.diff = None;
@@ -318,7 +361,7 @@ impl App {
         let progress = Arc::new(Progress::with_estimate(estimate));
         let (tx, rx) = std::sync::mpsc::channel();
         let (p, opts, scan_path) = (progress.clone(), self.opts.clone(), path.clone());
-        let (sort, cache, mut meta) = (self.sort, self.cache_path.clone(), self.meta.clone());
+        let (sort, cache, mut meta) = (self.sort, self.use_cache, self.meta.clone());
         std::thread::Builder::new()
             .name("dut-scan".into())
             .spawn(move || {
@@ -334,15 +377,11 @@ impl App {
                         meta.scanned_at = now_unix();
                         meta.scan_millis = t0.elapsed().as_millis() as u64;
                         let cancelled = p.cancel.load(std::sync::atomic::Ordering::Relaxed);
-                        let cache_err = match &cache {
-                            Some(c) if !cancelled => {
-                                p.saving.store(true, std::sync::atomic::Ordering::Relaxed);
-                                crate::cache::ensure_dir(c)
-                                    .map_err(anyhow::Error::from)
-                                    .and_then(|()| snapshot::save(c, &tree, &meta))
-                                    .err()
-                            }
-                            _ => None,
+                        let cache_err = if cache && !cancelled {
+                            p.saving.store(true, std::sync::atomic::Ordering::Relaxed);
+                            crate::cache::save(&tree, &meta).err()
+                        } else {
+                            None
                         };
                         JobResult::Full(Ok(FullScan {
                             tree,
@@ -466,13 +505,14 @@ impl App {
             tree.sort_all(self.sort);
         }
         self.cache_err = cache_err;
-        self.cache_dirty = self.cache_path.is_some() && self.cache_err.is_some();
+        self.cache_dirty = self.use_cache && self.cache_err.is_some();
         self.stale = false;
+        self.stale_source = None;
         let old_time = self.meta.scanned_at;
         self.meta.scanned_at = meta.scanned_at;
         self.meta.scan_millis = meta.scan_millis;
         if self.tree.is_none() {
-            self.set_built_tree(tree);
+            self.set_tree(tree);
             return;
         }
         let vs = self.capture_view();
@@ -511,7 +551,7 @@ impl App {
             let e = tree.to_entry(tree.root);
             *tree = Tree::from_entry(e, sort);
         }
-        self.cache_dirty = self.cache_path.is_some();
+        self.cache_dirty = self.use_cache;
         self.restore_view(vs);
     }
 
@@ -556,7 +596,7 @@ impl App {
             View::Tree => self.rows.get(self.tree_pos.sel).map(|r| r.id),
             View::Treemap => self.tm_rects.get(self.tm_sel).map(|r| r.0),
             View::Files => self.files.get(self.files_pos.sel).copied(),
-            View::Types => None,
+            View::Types | View::History => None,
             View::Changes => self.changes.get(self.changes_pos.sel).and_then(|c| c.cur),
         }
     }
@@ -600,6 +640,89 @@ impl App {
             return;
         };
         (self.changes, self.changes_sum) = d.changes(t, self.view_root, self.use_disk, TOP_FILES);
+    }
+
+    // ---- history view ------------------------------------------------------
+
+    /// Loads, in the background, the viewed directory's size from each
+    /// cached snapshot of this root.
+    pub fn ensure_history(&mut self) {
+        let key = (self.structure_gen, self.view_root);
+        if self.history_key != Some(key) {
+            self.history_key = Some(key);
+            self.history_pos = ListPos::default();
+            let tree = self.tree.as_ref().unwrap();
+            let path = tree.path(self.view_root);
+            self.history = vec![HistPoint::from_tree(
+                tree,
+                self.view_root,
+                self.meta.scanned_at,
+                None,
+            )];
+            let files: Vec<(u64, PathBuf)> = crate::cache::Key::of(&self.meta)
+                .history()
+                .into_iter()
+                .filter(|(t, _)| *t != self.meta.scanned_at)
+                .collect();
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.history_rx = Some(rx);
+            std::thread::spawn(move || {
+                for (time, file) in files {
+                    let point =
+                        match snapshot::load_tree(&file, SortKey::Name, Some(&path), Some(1)) {
+                            Ok((t, _)) => HistPoint::from_tree(&t, t.root, time, Some(file)),
+                            Err(_) => HistPoint {
+                                time,
+                                file: Some(file),
+                                totals: None,
+                                children: Vec::new(),
+                            },
+                        };
+                    // The view moved on; stop.
+                    if tx.send(point).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        if let Some(rx) = &self.history_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(p) => self.history.push(p),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.history_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn history_loading(&self) -> bool {
+        self.history_rx.is_some()
+    }
+
+    /// Uses the selected historical snapshot as the comparison baseline.
+    fn compare_with_history(&mut self) {
+        let Some(file) = self
+            .history
+            .get(self.history_pos.sel)
+            .and_then(|p| p.file.clone())
+        else {
+            return self.flash("pick an older snapshot to compare with");
+        };
+        match snapshot::load(&file, SortKey::Name) {
+            Ok((tree, meta)) => {
+                self.set_baseline(Diff::from_tree(tree, meta.scanned_at));
+                self.view = View::Changes;
+                self.flash(format!(
+                    "comparing with snapshot from {}",
+                    crate::fmt::ago(meta.scanned_at)
+                ));
+            }
+            Err(e) => self.flash(format!("loading snapshot: {e:#}")),
+        }
     }
 
     // ---- deletion ----------------------------------------------------------
@@ -657,7 +780,7 @@ impl App {
             let parent = tree.node(id).parent;
             tree.remove(id, sort);
             self.expanded.remove(&id);
-            self.cache_dirty = self.cache_path.is_some();
+            self.cache_dirty = self.use_cache;
             self.generation += 1;
             self.structure_gen += 1;
             self.rebuild_rows();
@@ -932,6 +1055,7 @@ impl App {
             Which::Files => (&mut self.files_pos, self.files.len()),
             Which::Types => (&mut self.types_pos, self.types.len()),
             Which::Changes => (&mut self.changes_pos, self.changes.len()),
+            Which::History => (&mut self.history_pos, self.history.len()),
         };
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => pos.move_by(1, len),
@@ -1040,6 +1164,7 @@ impl App {
             KeyCode::Char('3') => self.view = View::Files,
             KeyCode::Char('4') => self.view = View::Types,
             KeyCode::Char('5') => self.view = View::Changes,
+            KeyCode::Char('6') => self.view = View::History,
             KeyCode::Char('d') | KeyCode::Delete if !ctrl => self.ask_delete(),
             KeyCode::Char('v') => {
                 let i = View::ALL.iter().position(|&v| v == self.view).unwrap();
@@ -1111,6 +1236,10 @@ impl App {
                     KeyCode::Enter => self.reveal_change(),
                     _ => self.list_nav(key, page, Which::Changes),
                 },
+                View::History => match key.code {
+                    KeyCode::Enter => self.compare_with_history(),
+                    _ => self.list_nav(key, page, Which::History),
+                },
             },
         }
     }
@@ -1166,7 +1295,7 @@ impl App {
                 page = (f.area().height as isize - 4).max(1);
                 crate::ui::draw(f, &mut self)
             })?;
-            let timeout = if self.job.is_some() {
+            let timeout = if self.job.is_some() || self.history_loading() {
                 Duration::from_millis(100)
             } else {
                 Duration::from_millis(1000)
@@ -1191,14 +1320,11 @@ impl App {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         // Persist subtree refreshes / deletes so the next run starts from them.
-        if let (true, Some(path)) = (
-            self.cache_dirty && self.tree.is_some(),
-            self.cache_path.clone(),
-        ) {
+        if self.cache_dirty && self.tree.is_some() {
             self.flash("saving cache…");
             terminal.draw(|f| crate::ui::draw(f, &mut self))?;
             let tree = self.tree.as_ref().unwrap();
-            snapshot::save(&path, tree, &self.meta).context("saving cache")?;
+            crate::cache::save(tree, &self.meta).context("saving cache")?;
         }
         Ok(())
     }
@@ -1210,6 +1336,7 @@ enum Which {
     Files,
     Types,
     Changes,
+    History,
 }
 
 fn push_rows(

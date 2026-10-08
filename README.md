@@ -16,7 +16,10 @@ Fast interactive disk usage analyzer for the terminal.
   (per root and options, mode 0600). Next time, `dut PATH` opens the cached
   result instantly, refreshes it in the background, and shows what changed.
   `--cached` skips the refresh, `--no-cache` turns it off, `DUT_CACHE_DIR`
-  overrides the location.
+  overrides the location. A subdirectory of a cached root opens from the
+  parent's snapshot. A history is kept (3 latest, then daily for a week and
+  weekly for 8 weeks; roots unused for 90 days are dropped; 2 GiB cap), shown
+  in the History view. `--cache-list` and `--clear-cache [PATH]` manage it.
 - **Changes**: compare against an older snapshot (`--diff old.dut`) or the
   state before a refresh. The tree gets a +/- column, and view `5` lists the
   biggest growers, new and removed entries.

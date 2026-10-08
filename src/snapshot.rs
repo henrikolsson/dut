@@ -3,7 +3,7 @@
 //! Only each node's *own* size is stored; aggregates are recomputed on load,
 //! which keeps files small and guarantees they are self-consistent.
 
-use crate::tree::{Entry, Kind, NodeId, Tree};
+use crate::tree::{Kind, NO_PARENT, Node, NodeId, SortKey, Tree, sort_node_ids};
 use anyhow::{Context, bail};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -120,11 +120,13 @@ pub fn save(path: &Path, tree: &Tree, meta: &Meta) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn load(path: &Path) -> anyhow::Result<(Entry, Meta)> {
+/// Opens a snapshot and reads its header, leaving the reader at the node count.
+fn open(path: &Path) -> anyhow::Result<(impl Read, Meta)> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut r = BufReader::with_capacity(1 << 20, file);
     let mut magic = [0u8; 8];
-    r.read_exact(&mut magic)?;
+    r.read_exact(&mut magic)
+        .with_context(|| format!("{} is not a dut snapshot", path.display()))?;
     if &magic != MAGIC {
         bail!("{} is not a dut snapshot", path.display());
     }
@@ -152,58 +154,178 @@ pub fn load(path: &Path) -> anyhow::Result<(Entry, Meta)> {
             meta.exclude.push(String::from_utf8_lossy(&p).into_owned());
         }
     }
-    let _count = get_varint(&mut z)?;
+    Ok((z, meta))
+}
 
-    // Preorder rebuild: a stack of open directories with remaining child counts.
-    let mut stack: Vec<(Entry, u64)> = Vec::new();
-    loop {
+/// Reads only a snapshot's header.
+pub fn read_meta(path: &Path) -> anyhow::Result<Meta> {
+    Ok(open(path)?.1)
+}
+
+pub fn load(path: &Path, sort: SortKey) -> anyhow::Result<(Tree, Meta)> {
+    load_tree(path, sort, None, None)
+}
+
+#[derive(Clone, Copy)]
+enum Place {
+    /// On the way down to the requested subtree, `n` components matched.
+    Path(usize),
+    /// Inside the requested subtree, at this depth below its root.
+    Inside(usize),
+    /// Somewhere irrelevant: parsed, not kept.
+    Skip,
+}
+
+struct Frame {
+    id: Option<NodeId>,
+    place: Place,
+    remaining: u64,
+    children: Vec<NodeId>,
+    size: u64,
+    disk: u64,
+    items: u64,
+}
+
+/// Loads a snapshot straight into an arena tree.
+///
+/// With `sub`, only the subtree at that path (which must lie below the
+/// snapshot's root) is kept; reading stops as soon as it is complete. With
+/// `max_depth`, nodes deeper than that below the kept root are aggregated
+/// into their ancestors but not materialized.
+pub fn load_tree(
+    path: &Path,
+    sort: SortKey,
+    sub: Option<&Path>,
+    max_depth: Option<usize>,
+) -> anyhow::Result<(Tree, Meta)> {
+    let (mut z, mut meta) = open(path)?;
+    let target: Vec<Box<[u8]>> = match sub {
+        Some(p) if p != meta.root => {
+            let rel = p.strip_prefix(&meta.root).with_context(|| {
+                format!("{} is not inside {}", p.display(), meta.root.display())
+            })?;
+            rel.iter().map(|c| c.as_bytes().into()).collect()
+        }
+        _ => Vec::new(),
+    };
+    // Note `join("")` would add a trailing slash.
+    let mut target_path = meta.root.clone();
+    for c in &target {
+        target_path.push(std::ffi::OsStr::from_bytes(c));
+    }
+    let count = get_varint(&mut z)?;
+    let mut nodes: Vec<Node> = Vec::new();
+    if target.is_empty() && max_depth.is_none() {
+        nodes.reserve(count.min(1 << 28) as usize);
+    }
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut root = None;
+
+    'records: loop {
         let mut hdr = [0u8; 2];
         z.read_exact(&mut hdr).context("truncated snapshot")?;
         let kind = Kind::from_u8(hdr[0]).context("corrupt snapshot")?;
-        let mut e = Entry {
-            name: get_bytes(&mut z)?,
-            kind,
-            flags: hdr[1],
-            size: get_varint(&mut z)?,
-            disk: get_varint(&mut z)?,
-            items: 1,
-            children: Vec::new(),
-        };
+        let name = get_bytes(&mut z)?;
+        let (size, disk) = (get_varint(&mut z)?, get_varint(&mut z)?);
         let nchildren = if kind == Kind::Dir {
             get_varint(&mut z)?
         } else {
             0
         };
-        if nchildren > 0 {
-            e.children.reserve(nchildren.min(1 << 16) as usize);
-            stack.push((e, nchildren));
-            continue;
-        }
-        // `e` is complete; attach it and close any directories it completes.
-        loop {
-            match stack.last_mut() {
-                None => return Ok((e, meta)),
-                Some((parent, remaining)) => {
-                    parent.size += e.size;
-                    parent.disk += e.disk;
-                    parent.items += e.items;
-                    parent.children.push(e);
-                    *remaining -= 1;
-                    if *remaining > 0 {
-                        break;
-                    }
-                    e = stack.pop().unwrap().0;
+
+        let place = match stack.last().map(|f| f.place) {
+            None if target.is_empty() => Place::Inside(0),
+            None => Place::Path(0),
+            Some(Place::Path(k)) if name == target[k] => {
+                if k + 1 == target.len() {
+                    Place::Inside(0)
+                } else {
+                    Place::Path(k + 1)
                 }
             }
+            Some(Place::Inside(d)) => Place::Inside(d + 1),
+            Some(_) => Place::Skip,
+        };
+        let id = match place {
+            Place::Inside(d) if max_depth.is_none_or(|m| d <= m) => {
+                let (parent, name) = match d {
+                    0 => (NO_PARENT, target_path.as_os_str().as_bytes().into()),
+                    _ => (stack.last().unwrap().id.unwrap(), name),
+                };
+                nodes.push(Node {
+                    name,
+                    children: Box::new([]),
+                    size,
+                    disk,
+                    items: 1,
+                    parent,
+                    kind,
+                    flags: hdr[1],
+                });
+                Some((nodes.len() - 1) as NodeId)
+            }
+            _ => None,
+        };
+        let mut done = Frame {
+            id,
+            place,
+            remaining: nchildren,
+            children: Vec::new(),
+            size,
+            disk,
+            items: 1,
+        };
+        if nchildren > 0 {
+            stack.push(done);
+            continue;
+        }
+        // `done` is complete; close it and any directories it completes.
+        loop {
+            if let Some(id) = done.id {
+                sort_node_ids(&nodes, &mut done.children, sort);
+                let n = &mut nodes[id as usize];
+                n.size = done.size;
+                n.disk = done.disk;
+                n.items = done.items;
+                n.children = std::mem::take(&mut done.children).into_boxed_slice();
+                if matches!(done.place, Place::Inside(0)) {
+                    root = Some(id);
+                    // Everything we need has been read.
+                    break 'records;
+                }
+            }
+            let Some(p) = stack.last_mut() else {
+                break 'records;
+            };
+            p.size += done.size;
+            p.disk += done.disk;
+            p.items += done.items;
+            if let (Some(id), Some(_)) = (done.id, p.id) {
+                p.children.push(id);
+            }
+            p.remaining -= 1;
+            if p.remaining > 0 {
+                break;
+            }
+            done = stack.pop().unwrap();
         }
     }
+    let root = root.with_context(|| format!("{} is not in the snapshot", target_path.display()))?;
+    meta.root = target_path;
+    Ok((
+        Tree {
+            nodes,
+            root,
+            garbage: 0,
+        },
+        meta,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scan::{Excludes, Progress, ScanOptions, scan};
-    use crate::tree::SortKey;
     use std::sync::Arc;
 
     #[test]
@@ -236,8 +358,22 @@ mod tests {
         };
         let file = dir.with_extension("dut");
         save(&file, &tree, &meta).unwrap();
-        let (e2, m2) = load(&file).unwrap();
-        assert_eq!((e2.items, e2.size, e2.disk), (items, size, disk));
+        let (t2, m2) = load(&file, SortKey::Disk).unwrap();
+        let r = t2.root_node();
+        assert_eq!(t2.path(t2.root), dir);
+        assert_eq!((r.items, r.size, r.disk), (items, size, disk));
+        let (sub, sm) = load_tree(&file, SortKey::Disk, Some(&dir.join("a/b")), None).unwrap();
+        assert_eq!(sub.root_node().items, 2);
+        let a = t2.find_child(t2.root, b"a").unwrap();
+        let ab = t2.find_child(a, b"b").unwrap();
+        assert_eq!(sub.root_node().size, t2.node(ab).size);
+        assert!(sub.root_node().size >= 10_000);
+        assert_eq!(sm.root, dir.join("a/b"));
+        assert_eq!(sub.path(sub.root), dir.join("a/b"));
+        let (shallow, _) = load_tree(&file, SortKey::Disk, None, Some(1)).unwrap();
+        assert_eq!(shallow.root_node().items, items);
+        assert_eq!(shallow.nodes.len(), 3); // root, a, g; a/* aggregated only
+        assert!(load_tree(&file, SortKey::Disk, Some(&dir.join("nope")), None).is_err());
         assert_eq!(
             (m2.root, m2.scanned_at, m2.scan_millis),
             (dir.clone(), 42, 7)

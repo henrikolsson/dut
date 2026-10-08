@@ -45,6 +45,23 @@ pub fn duration_ms(ms: u64) -> String {
     }
 }
 
+/// Local date and time, e.g. "2026-10-08 09:18".
+pub fn datetime(unix_secs: u64) -> String {
+    let t = unix_secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return unix_secs.to_string();
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    )
+}
+
 pub fn ago(unix_secs: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

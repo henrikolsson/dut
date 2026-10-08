@@ -147,15 +147,7 @@ impl Tree {
     }
 
     fn sort_ids(&self, ids: &mut [NodeId], sort: SortKey) {
-        let n = &self.nodes;
-        match sort {
-            SortKey::Disk => ids.sort_unstable_by_key(|&i| std::cmp::Reverse(n[i as usize].disk)),
-            SortKey::Size => ids.sort_unstable_by_key(|&i| std::cmp::Reverse(n[i as usize].size)),
-            SortKey::Items => ids.sort_unstable_by_key(|&i| std::cmp::Reverse(n[i as usize].items)),
-            SortKey::Name => {
-                ids.sort_unstable_by(|&a, &b| n[a as usize].name.cmp(&n[b as usize].name))
-            }
-        }
+        sort_node_ids(&self.nodes, ids, sort);
     }
 
     fn sort_children_of(&mut self, id: NodeId, sort: SortKey) {
@@ -324,5 +316,14 @@ impl Tree {
             items: n.items,
             children: n.children.iter().map(|&c| self.to_entry(c)).collect(),
         }
+    }
+}
+
+pub fn sort_node_ids(n: &[Node], ids: &mut [NodeId], sort: SortKey) {
+    match sort {
+        SortKey::Disk => ids.sort_unstable_by_key(|&i| std::cmp::Reverse(n[i as usize].disk)),
+        SortKey::Size => ids.sort_unstable_by_key(|&i| std::cmp::Reverse(n[i as usize].size)),
+        SortKey::Items => ids.sort_unstable_by_key(|&i| std::cmp::Reverse(n[i as usize].items)),
+        SortKey::Name => ids.sort_unstable_by(|&a, &b| n[a as usize].name.cmp(&n[b as usize].name)),
     }
 }

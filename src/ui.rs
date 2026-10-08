@@ -48,6 +48,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::Files => draw_files(f, body, app),
         View::Types => draw_types(f, body, app),
         View::Changes => draw_changes(f, body, app),
+        View::History => draw_history(f, body, app),
     }
     draw_footer(f, footer, app);
 
@@ -153,7 +154,14 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     if app.stale {
         left.push(Span::raw("  "));
         left.push(Span::styled(
-            format!(" cached {} · refreshing… ", fmt::ago(app.meta.scanned_at)),
+            match &app.stale_source {
+                Some(src) => format!(
+                    " from {} snapshot, {} · refreshing… ",
+                    src.display(),
+                    fmt::ago(app.meta.scanned_at)
+                ),
+                None => format!(" cached {} · refreshing… ", fmt::ago(app.meta.scanned_at)),
+            },
             Style::new().fg(Color::Black).bg(Color::Yellow),
         ));
     }
@@ -296,6 +304,12 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                 ("?", "help"),
             ],
             View::Types => &[("⏎", "list files of type"), ("⌫", "up"), ("?", "help")],
+            View::History => &[
+                ("⏎", "compare with snapshot"),
+                ("⌫", "up"),
+                ("1", "tree to zoom"),
+                ("?", "help"),
+            ],
             View::Changes => &[
                 ("⏎", "show in tree"),
                 ("⌫", "up"),
@@ -765,6 +779,7 @@ fn draw_help(f: &mut Frame) {
         ("esc", "cancel scan / back / quit"),
         ("d del", "delete selected (asks first)"),
         ("5", "changes since baseline snapshot / previous scan"),
+        ("6", "history: size over time from cached snapshots"),
         ("q", "quit"),
     ];
     let mut lines: Vec<Line> = keys
@@ -1002,4 +1017,154 @@ fn draw_errors(f: &mut Frame, errors: &[String]) {
         .border_style(Style::new().fg(Color::Red))
         .title(" delete incomplete ".bold());
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_history(f: &mut Frame, area: Rect, app: &mut App) {
+    app.ensure_history();
+    let use_disk = app.use_disk;
+    let pick = |t: &(u64, u64, u64)| if use_disk { t.1 } else { t.0 };
+    let points = &app.history;
+    let n = points.len();
+    let list_h = (n as u16 + 1).clamp(3, area.height / 2);
+    let [top, bottom] =
+        Layout::vertical([Constraint::Length(list_h), Constraint::Min(0)]).areas(area);
+
+    // Snapshots, newest first, with the change from the next older one.
+    let title = if app.history_loading() {
+        format!(" {n} snapshots (loading…) ")
+    } else if n == 1 {
+        " no older snapshots yet; they accumulate as you rescan ".to_string()
+    } else {
+        format!(" {n} snapshots ")
+    };
+    let block = list_block(title);
+    let inner = block.inner(top);
+    f.render_widget(block, top);
+    let max = points
+        .iter()
+        .filter_map(|p| p.totals.as_ref().map(pick))
+        .max()
+        .unwrap_or(0);
+    let height = inner.height as usize;
+    app.history_pos.clamp(n);
+    app.history_pos.scroll(height);
+    let mut lines = Vec::with_capacity(height);
+    for (i, p) in points
+        .iter()
+        .enumerate()
+        .skip(app.history_pos.offset)
+        .take(height)
+    {
+        let when = if p.file.is_none() {
+            format!("{} (current)", fmt::datetime(p.time))
+        } else {
+            fmt::datetime(p.time)
+        };
+        let mut spans = vec![
+            Span::raw(format!(" {when:<24}")),
+            Span::styled(format!("{:>9} ", fmt::ago(p.time)), Style::new().fg(DIM)),
+        ];
+        match &p.totals {
+            Some(t) => {
+                let s = pick(t);
+                let older = points[i + 1..]
+                    .iter()
+                    .find_map(|q| q.totals.as_ref().map(pick));
+                spans.push(Span::raw(format!("{:>9} ", fmt::size(s))));
+                spans.push(match older {
+                    Some(o) => delta_span(Some(Change::Delta(s as i64 - o as i64))),
+                    None => Span::raw(" ".repeat(10)),
+                });
+                spans.push(Span::raw("  "));
+                let fr = frac(s, max);
+                spans.push(Span::styled(
+                    bar(fr, 30),
+                    Style::new().fg(ACCENT).bg(Color::Indexed(235)),
+                ));
+            }
+            None => spans.push(Span::styled("   (did not exist)", Style::new().fg(DIM))),
+        }
+        let mut line = Line::from(spans);
+        if i == app.history_pos.sel {
+            line = line.style(Style::new().bg(SEL_BG));
+        }
+        lines.push(line);
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+
+    // Growth by subdirectory: one column per snapshot, oldest to newest.
+    let block = list_block(" growth by entry ".into());
+    let inner = block.inner(bottom);
+    f.render_widget(block, bottom);
+    let present: Vec<&crate::app::HistPoint> =
+        points.iter().filter(|p| p.totals.is_some()).collect();
+    if present.len() < 2 || inner.height < 2 {
+        return;
+    }
+    const COL: u16 = 10;
+    let name_w: u16 = 28;
+    let cols = ((inner.width.saturating_sub(name_w + COL + 2)) / COL).max(1) as usize;
+    // Newest `cols` snapshots, shown oldest first.
+    let shown: Vec<&crate::app::HistPoint> = present.iter().take(cols).rev().copied().collect();
+    let size_of = |p: &crate::app::HistPoint, name: &[u8]| -> Option<u64> {
+        p.children
+            .iter()
+            .find(|c| &*c.0 == name)
+            .map(|c| if use_disk { c.2 } else { c.1 })
+    };
+    // Rows: entries with the largest change across the shown period.
+    let (first, last) = (shown[0], *shown.last().unwrap());
+    let mut names: Vec<&[u8]> = last.children.iter().map(|c| &*c.0).collect();
+    for c in &first.children {
+        if !names.contains(&&*c.0) {
+            names.push(&c.0);
+        }
+    }
+    let mut rows: Vec<(&[u8], i64)> = names
+        .into_iter()
+        .map(|nm| {
+            let a = size_of(first, nm).unwrap_or(0) as i64;
+            let b = size_of(last, nm).unwrap_or(0) as i64;
+            (nm, b - a)
+        })
+        .collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1.unsigned_abs()));
+
+    let mut header = vec![Span::styled(
+        format!(" {:<w$}", "", w = name_w as usize),
+        Style::new().fg(DIM),
+    )];
+    for p in &shown {
+        let label = if p.file.is_none() {
+            "now".to_string()
+        } else {
+            fmt::ago(p.time)
+        };
+        header.push(Span::styled(
+            format!("{label:>w$}", w = COL as usize),
+            Style::new().fg(DIM),
+        ));
+    }
+    header.push(Span::styled(
+        format!("{:>w$}", "change", w = COL as usize + 1),
+        Style::new().fg(DIM),
+    ));
+    let mut lines = vec![Line::from(header)];
+    for (name, d) in rows.iter().take(inner.height as usize - 1) {
+        let mut label = String::from_utf8_lossy(name).into_owned();
+        if label.chars().count() > name_w as usize - 1 {
+            label = label.chars().take(name_w as usize - 2).collect::<String>() + "…";
+        }
+        let mut spans = vec![Span::raw(format!(" {label:<w$}", w = name_w as usize))];
+        for p in &shown {
+            let cell = size_of(p, name).map_or("-".to_string(), fmt::size);
+            spans.push(Span::styled(
+                format!("{cell:>w$}", w = COL as usize),
+                Style::new().fg(DIM),
+            ));
+        }
+        spans.push(delta_span(Some(Change::Delta(*d))));
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
