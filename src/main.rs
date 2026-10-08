@@ -228,7 +228,8 @@ fn main() -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
     let res = app.run(&mut terminal);
     ratatui::restore();
-    res
+    res?;
+    app.finish()
 }
 
 fn estimate_from(t: &tree::Tree) -> scan::Estimate {

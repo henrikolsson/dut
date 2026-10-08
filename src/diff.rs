@@ -6,6 +6,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 /// `map` value for nodes outside the compared region.
 const OUTSIDE: u32 = u32::MAX;
@@ -33,15 +34,24 @@ pub struct Summary {
     pub removed: u64,
 }
 
+/// Cheap to clone, so a copy can be handed to a background thread.
+#[derive(Clone)]
 pub struct Diff {
-    pub base: Tree,
+    pub base: Arc<Tree>,
     /// When the baseline was scanned (unix seconds).
     pub base_time: u64,
+    /// Matching of the current tree's nodes, once built (see `sync`).
+    mapping: Option<Arc<Mapping>>,
+}
+
+/// Which baseline node each node of the current tree corresponds to.
+pub struct Mapping {
+    /// Structure generation of the current tree this was built for.
+    generation: u64,
     /// Current node id -> baseline node id (or OUTSIDE / NEW).
     map: Vec<u32>,
     /// Topmost matched pair; everything compared lies below it.
     anchor: Option<(NodeId, NodeId)>,
-    built_for: Option<u64>,
 }
 
 impl Diff {
@@ -50,13 +60,11 @@ impl Diff {
         Diff::from_tree(Tree::from_entry(base, SortKey::Name), base_time)
     }
 
-    pub fn from_tree(base: Tree, base_time: u64) -> Diff {
+    pub fn from_tree(base: impl Into<Arc<Tree>>, base_time: u64) -> Diff {
         Diff {
-            base,
+            base: base.into(),
             base_time,
-            map: Vec::new(),
-            anchor: None,
-            built_for: None,
+            mapping: None,
         }
     }
 
@@ -69,20 +77,53 @@ impl Diff {
         path.starts_with(self.base_path())
     }
 
-    pub fn overlaps(&self) -> bool {
-        self.anchor.is_some()
+    pub fn overlaps(&self, cur: &Tree) -> bool {
+        find_anchor(cur, &self.base).is_some()
     }
 
-    /// Recomputes the node mapping if the current tree changed shape.
-    pub fn sync(&mut self, cur: &Tree, generation: u64) {
-        if self.built_for == Some(generation) {
-            return;
+    /// Whether the mapping is missing or was built for another generation
+    /// of the current tree.
+    pub fn needs_mapping(&self, generation: u64) -> bool {
+        self.mapping
+            .as_ref()
+            .is_none_or(|m| m.generation != generation)
+    }
+
+    /// Drops a mapping that no longer matches the current tree; until a new
+    /// one is set, nothing shows as changed.
+    pub fn clear_stale_mapping(&mut self, generation: u64) {
+        if self.needs_mapping(generation) {
+            self.mapping = None;
         }
-        self.built_for = Some(generation);
-        self.map = vec![OUTSIDE; cur.nodes.len()];
-        self.anchor = find_anchor(cur, &self.base);
-        let Some((c0, b0)) = self.anchor else { return };
-        self.map[c0 as usize] = b0;
+    }
+
+    pub fn set_mapping(&mut self, m: Mapping) {
+        self.mapping = Some(Arc::new(m));
+    }
+
+    /// Builds and sets the mapping, if the current tree changed shape.
+    #[cfg(test)]
+    pub fn sync(&mut self, cur: &Tree, generation: u64) {
+        if self.needs_mapping(generation) {
+            let m = self.build_mapping(cur, generation);
+            self.set_mapping(m);
+        }
+    }
+
+    /// Matches the current tree's nodes to the baseline's by name. Linear in
+    /// the size of the tree, so worth doing off the UI thread.
+    pub fn build_mapping(&self, cur: &Tree, generation: u64) -> Mapping {
+        let mut map = vec![OUTSIDE; cur.nodes.len()];
+        let anchor = find_anchor(cur, &self.base);
+        let mapping = |map| Mapping {
+            generation,
+            map,
+            anchor,
+        };
+        let Some((c0, b0)) = anchor else {
+            return mapping(map);
+        };
+        map[c0 as usize] = b0;
         let mut stack = vec![(c0, b0)];
         while let Some((c, b)) = stack.pop() {
             let cch = cur.children(c);
@@ -103,17 +144,18 @@ impl Diff {
                 };
                 match found {
                     Some(y) => {
-                        self.map[x as usize] = y;
+                        map[x as usize] = y;
                         stack.push((x, y));
                     }
-                    None => mark_new(cur, x, &mut self.map),
+                    None => mark_new(cur, x, &mut map),
                 }
             }
         }
+        mapping(map)
     }
 
     pub fn change(&self, cur: &Tree, id: NodeId, use_disk: bool) -> Option<Change> {
-        match *self.map.get(id as usize)? {
+        match *self.mapping.as_ref()?.map.get(id as usize)? {
             OUTSIDE => None,
             NEW => Some(Change::New),
             b => Some(Change::Delta(
@@ -132,6 +174,9 @@ impl Diff {
         limit: usize,
     ) -> (Vec<ChangeItem>, Summary) {
         let mut sum = Summary::default();
+        let Some(m) = &self.mapping else {
+            return (Vec::new(), sum);
+        };
         let mut heap: BinaryHeap<std::cmp::Reverse<(u64, i64, u32, u32)>> = BinaryHeap::new();
         let mut push = |item: ChangeItem, sum: &mut Summary| {
             match (item.cur, item.base) {
@@ -159,7 +204,7 @@ impl Diff {
         };
 
         // Start at `from` if it was matched, else at the anchor if it lies below.
-        let start = match self.map.get(from as usize).copied() {
+        let start = match m.map.get(from as usize).copied() {
             Some(NEW) => {
                 let d = metric(cur, from, use_disk) as i64;
                 push(
@@ -172,7 +217,7 @@ impl Diff {
                 );
                 None
             }
-            Some(OUTSIDE) | None => self.anchor.filter(|&(c, _)| cur.is_ancestor(from, c)),
+            Some(OUTSIDE) | None => m.anchor.filter(|&(c, _)| cur.is_ancestor(from, c)),
             Some(b) => Some((from, b)),
         };
 
@@ -195,7 +240,7 @@ impl Diff {
             }
             let mut matched: HashSet<NodeId> = HashSet::new();
             for &x in cur.children(c) {
-                match self.map[x as usize] {
+                match m.map[x as usize] {
                     NEW => {
                         let d = metric(cur, x, use_disk) as i64;
                         push(

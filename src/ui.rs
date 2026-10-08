@@ -682,8 +682,21 @@ fn draw_cell(
 
 // ---- files & types -----------------------------------------------------------
 
+/// Shown in a list view while its contents are computed in the background.
+fn draw_pending(f: &mut Frame, area: Rect, msg: &str) {
+    let block = list_block(String::new());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(
+        Line::styled(format!("  {msg}"), Style::new().fg(DIM)),
+        inner,
+    );
+}
+
 fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
-    app.ensure_files();
+    if !app.ensure_files() {
+        return draw_pending(f, area, "finding the largest files…");
+    }
     let tree = app.tree.as_ref().unwrap();
     let total = metric(app, tree, app.view_root);
     let title = format!(" {} largest files ", app.files.len());
@@ -728,7 +741,9 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_types(f: &mut Frame, area: Rect, app: &mut App) {
-    app.ensure_types();
+    if !app.ensure_types() {
+        return draw_pending(f, area, "adding up file types…");
+    }
     let tree = app.tree.as_ref().unwrap();
     let total = metric(app, tree, app.view_root);
     let block = list_block(format!(" {} file types ", app.types.len()));
@@ -870,7 +885,14 @@ fn delta_span(c: Option<Change>) -> Span<'static> {
 }
 
 fn draw_changes(f: &mut Frame, area: Rect, app: &mut App) {
-    app.ensure_changes();
+    if !app.ensure_changes() {
+        let msg = if app.diff_pending() {
+            "comparing with the baseline…"
+        } else {
+            "finding the biggest changes…"
+        };
+        return draw_pending(f, area, msg);
+    }
     let Some(diff) = &app.diff else {
         let lines = vec![
             Line::raw(""),

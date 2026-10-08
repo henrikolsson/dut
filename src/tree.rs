@@ -56,6 +56,7 @@ pub struct Entry {
     pub children: Vec<Entry>,
 }
 
+#[derive(Clone)]
 pub struct Node {
     pub name: Box<[u8]>,
     pub children: Box<[NodeId]>,
@@ -88,6 +89,7 @@ pub enum SortKey {
     Name,
 }
 
+#[derive(Clone)]
 pub struct Tree {
     pub nodes: Vec<Node>,
     pub root: NodeId,

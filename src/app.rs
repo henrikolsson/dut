@@ -11,9 +11,49 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TOP_FILES: usize = 1000;
+
+/// Work that walks the whole tree runs on a background thread, so the UI
+/// keeps responding on trees with millions of entries. `key` says what the
+/// result is for; results for an outdated key are dropped.
+struct Bg<K, T> {
+    key: K,
+    rx: Receiver<T>,
+}
+
+impl<K: PartialEq, T: Send + 'static> Bg<K, T> {
+    /// Returns the result for `key` once it's ready, starting `work` first
+    /// if the job in `slot` is for something else (or there is none).
+    fn poll(
+        slot: &mut Option<Self>,
+        key: K,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        match slot {
+            Some(job) if job.key == key => {
+                let res = job.rx.try_recv().ok()?;
+                *slot = None;
+                Some(res)
+            }
+            _ => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(work());
+                });
+                *slot = Some(Bg { key, rx });
+                None
+            }
+        }
+    }
+}
+
+type FilesKey = (u64, NodeId, bool, Option<String>);
+type TypesKey = (u64, NodeId, bool);
+/// Also identifies the baseline, by the address of its tree.
+type ChangesKey = (u64, NodeId, bool, usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -168,10 +208,14 @@ pub enum Mode {
 }
 
 pub struct App {
-    pub tree: Option<Tree>,
+    /// Shared with background work (views, cache saves). Changing it while
+    /// such work holds a reference copies it, so that's kept rare.
+    pub tree: Option<Arc<Tree>>,
     pub meta: Meta,
     pub opts: ScanOptions,
     pub sort: SortKey,
+    /// The tree still needs re-sorting by `sort`.
+    sort_pending: bool,
     pub use_disk: bool,
     pub view: View,
     pub view_root: NodeId,
@@ -187,6 +231,10 @@ pub struct App {
     pub structure_gen: u64,
     pub allow_delete: bool,
     pub diff: Option<Diff>,
+    /// Builds `diff`'s node mapping for (structure generation, baseline).
+    mapping_job: Option<Bg<(u64, usize), crate::diff::Mapping>>,
+    /// A snapshot being loaded to compare with.
+    baseline_job: Option<Receiver<anyhow::Result<(Tree, Meta)>>>,
     /// Baseline to compare against once the initial scan completes.
     pub pending_baseline: Option<(Tree, u64)>,
     /// Whether full scans are automatically saved to the cache.
@@ -196,6 +244,8 @@ pub struct App {
     /// The tree changed (subtree refresh, delete) since the cache was written.
     pub cache_dirty: bool,
     cache_err: Option<anyhow::Error>,
+    /// Background write of the cache after a refresh or delete.
+    cache_save: Option<JoinHandle<anyhow::Result<PathBuf>>>,
     /// Showing a cached snapshot while the background refresh runs.
     pub stale: bool,
 
@@ -216,10 +266,12 @@ pub struct App {
     pub files: Vec<NodeId>,
     pub files_pos: ListPos,
     pub files_filter: Option<String>,
-    files_key: Option<(u64, NodeId, bool, Option<String>)>,
+    files_key: Option<FilesKey>,
+    files_job: Option<Bg<FilesKey, Vec<NodeId>>>,
     pub types: Vec<TypeStat>,
     pub types_pos: ListPos,
-    types_key: Option<(u64, NodeId, bool)>,
+    types_key: Option<TypesKey>,
+    types_job: Option<Bg<TypesKey, Vec<TypeStat>>>,
 
     // History view
     pub history: Vec<HistPoint>,
@@ -231,7 +283,8 @@ pub struct App {
     pub changes: Vec<ChangeItem>,
     pub changes_sum: Summary,
     pub changes_pos: ListPos,
-    changes_key: Option<(u64, NodeId, bool)>,
+    changes_key: Option<ChangesKey>,
+    changes_job: Option<Bg<ChangesKey, (Vec<ChangeItem>, Summary)>>,
 
     quit: bool,
 }
@@ -253,6 +306,7 @@ impl App {
             } else {
                 SortKey::Size
             },
+            sort_pending: false,
             use_disk,
             view: View::Tree,
             view_root: 0,
@@ -265,11 +319,14 @@ impl App {
             structure_gen: 0,
             allow_delete: true,
             diff: None,
+            mapping_job: None,
+            baseline_job: None,
             pending_baseline: None,
             use_cache: false,
             stale_source: None,
             cache_dirty: false,
             cache_err: None,
+            cache_save: None,
             stale: false,
             expanded: HashSet::new(),
             rows: Vec::new(),
@@ -282,9 +339,11 @@ impl App {
             files_pos: ListPos::default(),
             files_filter: None,
             files_key: None,
+            files_job: None,
             types: Vec::new(),
             types_pos: ListPos::default(),
             types_key: None,
+            types_job: None,
             history: Vec::new(),
             history_pos: ListPos::default(),
             history_key: None,
@@ -293,13 +352,14 @@ impl App {
             changes_sum: Summary::default(),
             changes_pos: ListPos::default(),
             changes_key: None,
+            changes_job: None,
             quit: false,
         }
     }
 
     pub fn set_tree(&mut self, tree: Tree) {
         self.view_root = tree.root;
-        self.tree = Some(tree);
+        self.tree = Some(Arc::new(tree));
         self.generation += 1;
         self.structure_gen += 1;
         self.rows_dirty = true;
@@ -309,20 +369,41 @@ impl App {
     }
 
     pub fn set_baseline(&mut self, diff: Diff) {
+        if self.tree.as_ref().is_some_and(|t| !diff.overlaps(t)) {
+            self.flash("snapshot to compare with does not overlap the scanned path");
+            return;
+        }
         self.diff = Some(diff);
         self.changes_key = None;
-        self.ensure_diff();
-        if !self.diff.as_ref().unwrap().overlaps() {
-            self.diff = None;
-            self.flash("snapshot to compare with does not overlap the scanned path");
-        }
         self.generation += 1;
+        self.ensure_diff();
     }
 
+    /// Keeps the diff's node mapping in step with the tree, rebuilding it in
+    /// the background after the tree changes shape. Until it's ready, nothing
+    /// shows as changed.
     pub fn ensure_diff(&mut self) {
-        if let (Some(d), Some(t)) = (&mut self.diff, &self.tree) {
-            d.sync(t, self.structure_gen);
+        let (Some(d), Some(t)) = (&mut self.diff, &self.tree) else {
+            return;
+        };
+        let generation = self.structure_gen;
+        d.clear_stale_mapping(generation);
+        if !d.needs_mapping(generation) {
+            return;
         }
+        let key = (generation, Arc::as_ptr(&d.base) as usize);
+        let (cur, diff) = (Arc::clone(t), d.clone());
+        let work = move || diff.build_mapping(&cur, generation);
+        if let Some(m) = Bg::poll(&mut self.mapping_job, key, work) {
+            d.set_mapping(m);
+        }
+    }
+
+    /// Whether the changes view and markers wait on a background mapping.
+    pub fn diff_pending(&self) -> bool {
+        self.diff
+            .as_ref()
+            .is_some_and(|d| d.needs_mapping(self.structure_gen))
     }
 
     pub fn flash(&mut self, msg: impl Into<String>) {
@@ -406,6 +487,10 @@ impl App {
 
     fn poll_job(&mut self) {
         let Some(job) = &self.job else { return };
+        // Results change the tree; wait until background work lets go of it.
+        if !self.tree_unique() {
+            return;
+        }
         let res = match job.rx.try_recv() {
             Ok(r) => r,
             Err(TryRecvError::Empty) => return,
@@ -516,7 +601,7 @@ impl App {
             return;
         }
         let vs = self.capture_view();
-        let old = self.tree.replace(tree).unwrap();
+        let old = self.tree.replace(Arc::new(tree)).unwrap();
         if self
             .diff
             .as_ref()
@@ -536,7 +621,7 @@ impl App {
         let vs = self.capture_view();
         let sort = self.sort;
         let time = self.meta.scanned_at;
-        let tree = self.tree.as_mut().unwrap();
+        let tree = Arc::make_mut(self.tree.as_mut().unwrap());
         let target_path = tree.path(target);
         if self.diff.as_ref().is_some_and(|d| d.covers(&target_path)) {
             tree.replace(target, entry, sort);
@@ -627,19 +712,35 @@ impl App {
         }
     }
 
-    pub fn ensure_changes(&mut self) {
+    /// Returns false while the list is still being computed.
+    pub fn ensure_changes(&mut self) -> bool {
         self.ensure_diff();
-        let key = (self.structure_gen, self.view_root, self.use_disk);
-        if self.changes_key == Some(key) {
-            return;
-        }
-        self.changes_key = Some(key);
-        self.changes_pos = ListPos::default();
         let (Some(d), Some(t)) = (&self.diff, &self.tree) else {
             self.changes.clear();
-            return;
+            return true;
         };
-        (self.changes, self.changes_sum) = d.changes(t, self.view_root, self.use_disk, TOP_FILES);
+        if d.needs_mapping(self.structure_gen) {
+            return false;
+        }
+        let key = (
+            self.structure_gen,
+            self.view_root,
+            self.use_disk,
+            Arc::as_ptr(&d.base) as usize,
+        );
+        if self.changes_key == Some(key) {
+            return true;
+        }
+        let (cur, diff) = (Arc::clone(t), d.clone());
+        let (root, use_disk) = (self.view_root, self.use_disk);
+        let work = move || diff.changes(&cur, root, use_disk, TOP_FILES);
+        let Some((changes, sum)) = Bg::poll(&mut self.changes_job, key, work) else {
+            return false;
+        };
+        (self.changes, self.changes_sum) = (changes, sum);
+        self.changes_pos = ListPos::default();
+        self.changes_key = Some(key);
+        true
     }
 
     // ---- history view ------------------------------------------------------
@@ -712,7 +813,23 @@ impl App {
         else {
             return self.flash("pick an older snapshot to compare with");
         };
-        match snapshot::load(&file, SortKey::Name) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(snapshot::load(&file, SortKey::Name));
+        });
+        self.baseline_job = Some(rx);
+        self.flash("loading snapshot…");
+    }
+
+    fn poll_baseline(&mut self) {
+        let Some(rx) = &self.baseline_job else { return };
+        let res = match rx.try_recv() {
+            Ok(res) => res,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!("loader thread died")),
+        };
+        self.baseline_job = None;
+        match res {
             Ok((tree, meta)) => {
                 self.set_baseline(Diff::from_tree(tree, meta.scanned_at));
                 self.view = View::Changes;
@@ -723,6 +840,45 @@ impl App {
             }
             Err(e) => self.flash(format!("loading snapshot: {e:#}")),
         }
+    }
+
+    // ---- cache -----------------------------------------------------------
+
+    /// Writes the cache in the background once the tree changed (refresh,
+    /// delete), so quitting doesn't have to wait for it.
+    fn poll_cache_save(&mut self) {
+        if self.cache_save.as_ref().is_some_and(|h| h.is_finished())
+            && let Err(e) = join_save(self.cache_save.take().unwrap())
+        {
+            self.flash(format!("cache not saved: {e:#}"));
+        }
+        // A running scan will change the tree again (or save it itself).
+        if !self.cache_dirty || self.cache_save.is_some() || self.job.is_some() {
+            return;
+        }
+        let Some(tree) = &self.tree else { return };
+        self.cache_dirty = false;
+        let (tree, meta) = (Arc::clone(tree), self.meta.clone());
+        self.cache_save = Some(
+            std::thread::Builder::new()
+                .name("dut-save".into())
+                .spawn(move || crate::cache::save(&tree, &meta))
+                .expect("spawning save thread"),
+        );
+    }
+
+    /// Whether background work is running whose result should be shown
+    /// soon, so the UI polls more often.
+    fn busy(&self) -> bool {
+        self.job.is_some()
+            || self.history_loading()
+            || self.files_job.is_some()
+            || self.types_job.is_some()
+            || self.changes_job.is_some()
+            || self.mapping_job.is_some()
+            || self.baseline_job.is_some()
+            || self.cache_save.is_some()
+            || self.sort_pending
     }
 
     // ---- deletion ----------------------------------------------------------
@@ -776,7 +932,7 @@ impl App {
         let freed = job.progress.disk.load(std::sync::atomic::Ordering::Relaxed);
         if errors.is_empty() && !job.path.exists() {
             let sort = self.sort;
-            let tree = self.tree.as_mut().unwrap();
+            let tree = Arc::make_mut(self.tree.as_mut().unwrap());
             let parent = tree.node(id).parent;
             tree.remove(id, sort);
             self.expanded.remove(&id);
@@ -977,7 +1133,8 @@ impl App {
 
     // ---- files / types views ----------------------------------------------
 
-    pub fn ensure_files(&mut self) {
+    /// Returns false while the list is still being computed.
+    pub fn ensure_files(&mut self) -> bool {
         let key = (
             self.generation,
             self.view_root,
@@ -985,68 +1142,36 @@ impl App {
             self.files_filter.clone(),
         );
         if self.files_key.as_ref() == Some(&key) {
-            return;
+            return true;
         }
-        let tree = self.tree.as_ref().unwrap();
-        let use_disk = self.use_disk;
-        let filter = self.files_filter.as_deref();
-        let mut heap: BinaryHeap<std::cmp::Reverse<(u64, NodeId)>> = BinaryHeap::new();
-        let mut stack = vec![self.view_root];
-        while let Some(id) = stack.pop() {
-            let n = tree.node(id);
-            if n.kind == Kind::Dir {
-                stack.extend_from_slice(&n.children);
-                continue;
-            }
-            if filter.is_some_and(|f| extension(&n.name) != f) {
-                continue;
-            }
-            let s = if use_disk { n.disk } else { n.size };
-            if heap.len() < TOP_FILES {
-                heap.push(std::cmp::Reverse((s, id)));
-            } else if heap.peek().is_some_and(|m| m.0.0 < s) {
-                heap.pop();
-                heap.push(std::cmp::Reverse((s, id)));
-            }
-        }
-        let mut v: Vec<_> = heap.into_iter().map(|r| r.0).collect();
-        v.sort_unstable_by(|a, b| b.cmp(a));
-        self.files = v.into_iter().map(|(_, id)| id).collect();
+        let tree = Arc::clone(self.tree.as_ref().unwrap());
+        let (root, use_disk, filter) = (self.view_root, self.use_disk, self.files_filter.clone());
+        let work = move || largest_files(&tree, root, use_disk, filter.as_deref());
+        let Some(files) = Bg::poll(&mut self.files_job, key.clone(), work) else {
+            return false;
+        };
+        self.files = files;
         self.files_pos = ListPos::default();
         self.files_key = Some(key);
+        true
     }
 
-    pub fn ensure_types(&mut self) {
+    /// Returns false while the list is still being computed.
+    pub fn ensure_types(&mut self) -> bool {
         let key = (self.generation, self.view_root, self.use_disk);
         if self.types_key == Some(key) {
-            return;
+            return true;
         }
-        let tree = self.tree.as_ref().unwrap();
-        let mut map: HashMap<String, (u64, u64)> = HashMap::new();
-        let mut stack = vec![self.view_root];
-        while let Some(id) = stack.pop() {
-            let n = tree.node(id);
-            if n.kind == Kind::Dir {
-                stack.extend_from_slice(&n.children);
-                continue;
-            }
-            let s = if self.use_disk { n.disk } else { n.size };
-            let ext = extension(&n.name);
-            let e = match map.get_mut(ext.as_str()) {
-                Some(e) => e,
-                None => map.entry(ext).or_default(),
-            };
-            e.0 += s;
-            e.1 += 1;
-        }
-        let mut v: Vec<TypeStat> = map
-            .into_iter()
-            .map(|(ext, (bytes, count))| TypeStat { ext, bytes, count })
-            .collect();
-        v.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.ext.cmp(&b.ext)));
-        self.types = v;
+        let tree = Arc::clone(self.tree.as_ref().unwrap());
+        let (root, use_disk) = (self.view_root, self.use_disk);
+        let work = move || file_types(&tree, root, use_disk);
+        let Some(types) = Bg::poll(&mut self.types_job, key, work) else {
+            return false;
+        };
+        self.types = types;
         self.types_pos = ListPos::default();
         self.types_key = Some(key);
+        true
     }
 
     fn list_nav(&mut self, key: KeyEvent, page: isize, which: Which) {
@@ -1246,12 +1371,29 @@ impl App {
 
     fn set_sort(&mut self, sort: SortKey) {
         self.sort = sort;
+        self.sort_pending = true;
+        self.apply_sort();
+    }
+
+    /// Re-sorts the tree by `self.sort` once nothing else holds it.
+    fn apply_sort(&mut self) {
+        if !self.sort_pending || !self.tree_unique() {
+            return;
+        }
+        self.sort_pending = false;
         if let Some(t) = &mut self.tree {
-            t.sort_all(sort);
+            Arc::make_mut(t).sort_all(self.sort);
         }
         self.tm_sel = 0;
         self.rows_dirty = true;
         self.generation += 1;
+    }
+
+    /// Whether no background work holds the tree, so it can be changed in
+    /// place. Changing it while shared would copy all of it, which takes
+    /// longer than waiting for that work to finish.
+    fn tree_unique(&self) -> bool {
+        self.tree.as_ref().is_none_or(|t| Arc::strong_count(t) == 1)
     }
 
     fn open_save_prompt(&mut self) {
@@ -1284,19 +1426,22 @@ impl App {
         }
     }
 
-    pub fn run(mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
+    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         let mut page = 20isize;
         while !self.quit {
             self.poll_job();
             if self.quit {
                 break;
             }
+            self.poll_baseline();
+            self.poll_cache_save();
+            self.apply_sort();
             terminal.draw(|f| {
                 page = (f.area().height as isize - 4).max(1);
-                crate::ui::draw(f, &mut self)
+                crate::ui::draw(f, self)
             })?;
-            let timeout = if self.job.is_some() || self.history_loading() {
-                Duration::from_millis(100)
+            let timeout = if self.busy() {
+                Duration::from_millis(50)
             } else {
                 Duration::from_millis(1000)
             };
@@ -1314,19 +1459,44 @@ impl App {
                 }
             }
         }
-        if let Some(j) = &self.job {
-            j.progress
-                .cancel
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        // Persist subtree refreshes / deletes so the next run starts from them.
-        if self.cache_dirty && self.tree.is_some() {
-            self.flash("saving cache…");
-            terminal.draw(|f| crate::ui::draw(f, &mut self))?;
-            let tree = self.tree.as_ref().unwrap();
-            crate::cache::save(tree, &self.meta).context("saving cache")?;
-        }
         Ok(())
+    }
+
+    /// Called after the UI is gone: finishes cache writes so the next run
+    /// starts from them, and exits without freeing the tree (which can take
+    /// a while for millions of nodes; the OS does it for free).
+    pub fn finish(mut self) -> anyhow::Result<()> {
+        let mut notice = Notice::default();
+        if let Some(job) = self.job.take() {
+            if job
+                .progress
+                .saving
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                // The scan is done and being written to the cache; let it.
+                notice.show();
+                let _ = job.rx.recv();
+            } else {
+                job.progress
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let mut res = Ok(());
+        if let Some(h) = self.cache_save.take() {
+            notice.show();
+            res = join_save(h).map(|_| ());
+        }
+        // Persist subtree refreshes / deletes not saved yet.
+        if self.cache_dirty
+            && let Some(tree) = &self.tree
+        {
+            notice.show();
+            res = crate::cache::save(tree, &self.meta).map(|_| ());
+        }
+        notice.clear();
+        std::mem::forget(self);
+        res.context("saving cache")
     }
 }
 
@@ -1337,6 +1507,84 @@ enum Which {
     Types,
     Changes,
     History,
+}
+
+fn join_save(h: JoinHandle<anyhow::Result<PathBuf>>) -> anyhow::Result<PathBuf> {
+    h.join()
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("save thread panicked")))
+}
+
+/// A "saving cache…" line on stderr while exit waits, erased afterwards.
+#[derive(Default)]
+struct Notice(bool);
+
+impl Notice {
+    fn show(&mut self) {
+        if !self.0 {
+            self.0 = true;
+            eprint!("dut: saving cache…");
+        }
+    }
+
+    fn clear(&self) {
+        if self.0 {
+            eprint!("\r\x1b[2K");
+        }
+    }
+}
+
+/// The largest files below `root`, biggest first, optionally only those
+/// with extension `filter`.
+fn largest_files(tree: &Tree, root: NodeId, use_disk: bool, filter: Option<&str>) -> Vec<NodeId> {
+    let mut heap: BinaryHeap<std::cmp::Reverse<(u64, NodeId)>> = BinaryHeap::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        let n = tree.node(id);
+        if n.kind == Kind::Dir {
+            stack.extend_from_slice(&n.children);
+            continue;
+        }
+        if filter.is_some_and(|f| extension(&n.name) != f) {
+            continue;
+        }
+        let s = if use_disk { n.disk } else { n.size };
+        if heap.len() < TOP_FILES {
+            heap.push(std::cmp::Reverse((s, id)));
+        } else if heap.peek().is_some_and(|m| m.0.0 < s) {
+            heap.pop();
+            heap.push(std::cmp::Reverse((s, id)));
+        }
+    }
+    let mut v: Vec<_> = heap.into_iter().map(|r| r.0).collect();
+    v.sort_unstable_by(|a, b| b.cmp(a));
+    v.into_iter().map(|(_, id)| id).collect()
+}
+
+/// Usage below `root` per file extension, biggest first.
+fn file_types(tree: &Tree, root: NodeId, use_disk: bool) -> Vec<TypeStat> {
+    let mut map: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        let n = tree.node(id);
+        if n.kind == Kind::Dir {
+            stack.extend_from_slice(&n.children);
+            continue;
+        }
+        let s = if use_disk { n.disk } else { n.size };
+        let ext = extension(&n.name);
+        let e = match map.get_mut(ext.as_str()) {
+            Some(e) => e,
+            None => map.entry(ext).or_default(),
+        };
+        e.0 += s;
+        e.1 += 1;
+    }
+    let mut v: Vec<TypeStat> = map
+        .into_iter()
+        .map(|(ext, (bytes, count))| TypeStat { ext, bytes, count })
+        .collect();
+    v.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.ext.cmp(&b.ext)));
+    v
 }
 
 fn push_rows(
