@@ -67,5 +67,5 @@ the Linux side with
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and the Nix build
 on Linux and macOS, and pushes Nix outputs to the `dut` Cachix cache.
 Pushing a `v*` tag runs `release.yml`, which publishes static Linux and
-macOS binaries. Keep the version in `Cargo.toml` and `flake.nix` in sync
-with the tag.
+macOS binaries. It fails unless the tag is `v` plus the version in
+`Cargo.toml` (`flake.nix` reads the version from there).
