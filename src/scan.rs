@@ -77,6 +77,8 @@ pub struct Progress {
     pub disk: AtomicU64,
     pub errors: AtomicU64,
     pub cancel: AtomicBool,
+    /// Scan finished; the snapshot is being written.
+    pub saving: AtomicBool,
     /// Expected totals, if known, for percentage/ETA display.
     pub estimate: Option<Estimate>,
 }

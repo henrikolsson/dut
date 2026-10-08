@@ -12,6 +12,11 @@ Fast interactive disk usage analyzer for the terminal.
   `-f`, and refresh all of it (`R`) or one directory (`r`).
 - **Progress/ETA**: estimated from the previous scan when refreshing, or from
   filesystem usage when scanning a mount root.
+- **Automatic snapshots**: every full scan is cached in `~/.cache/dut/`
+  (per root and options, mode 0600). Next time, `dut PATH` opens the cached
+  result instantly, refreshes it in the background, and shows what changed.
+  `--cached` skips the refresh, `--no-cache` turns it off, `DUT_CACHE_DIR`
+  overrides the location.
 - **Changes**: compare against an older snapshot (`--diff old.dut`) or the
   state before a refresh. The tree gets a +/- column, and view `5` lists the
   biggest growers, new and removed entries.
@@ -29,7 +34,9 @@ dut [PATH]                         scan and browse (default: .)
 dut -x /                           don't cross into other mounts
 dut -f home.dut                    browse a saved snapshot
 dut -f home.dut --refresh          rescan the snapshot's root, then browse
-dut ~/ -o home.dut --no-ui         scan and save without the UI (cron-friendly)
+dut ~/ --no-ui                     refresh the automatic snapshot (cron-friendly)
+dut -c ~/                          open the automatic snapshot without rescanning
+dut ~/ -o home.dut --no-ui         scan and also save to a file
 dut ~/ --diff home.dut             scan and show what changed since the snapshot
 dut -f home.dut -r -o home.dut --no-ui   refresh a snapshot headlessly
 ```

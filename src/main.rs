@@ -1,4 +1,5 @@
 mod app;
+mod cache;
 mod delete;
 mod diff;
 mod fmt;
@@ -64,9 +65,18 @@ struct Cli {
     #[arg(long)]
     no_delete: bool,
 
-    /// Don't start the UI: scan (or refresh) and write the snapshot to --output
-    #[arg(long, requires = "output")]
+    /// Don't start the UI: scan (or refresh) and save the result to the
+    /// cache (and --output, if given)
+    #[arg(long)]
     no_ui: bool,
+
+    /// Don't read or write automatic snapshots (in ~/.cache/dut)
+    #[arg(long)]
+    no_cache: bool,
+
+    /// Open the automatic snapshot without rescanning
+    #[arg(short = 'c', long, conflicts_with_all = ["no_cache", "load"])]
+    cached: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -126,17 +136,54 @@ fn main() -> anyhow::Result<()> {
         exclude: std::sync::Arc::new(scan::Excludes::new(exclude)?),
     };
     let save_path = cli.output.clone().or_else(|| cli.load.clone());
+    let cache_path = if cli.no_cache {
+        None
+    } else {
+        cache::path_for(&meta.root, meta.one_file_system, &meta.exclude)
+    };
 
     if cli.no_ui {
-        return headless(meta, loaded, estimate, opts, cli.output.unwrap());
+        let outs: Vec<PathBuf> = cli.output.iter().chain(&cache_path).cloned().collect();
+        if outs.is_empty() {
+            bail!("--no-ui needs --output, or the cache enabled");
+        }
+        return headless(meta, loaded, estimate, opts, outs);
+    }
+
+    // Without an explicit snapshot, start from the automatic one if present:
+    // show it right away, refresh in the background, then compare.
+    let mut stale = false;
+    let mut loaded = loaded;
+    if cli.load.is_none() {
+        let cached = cache_path
+            .as_deref()
+            .filter(|p| p.exists())
+            .and_then(|p| snapshot::load(p).ok());
+        match cached {
+            Some((entry, m)) => {
+                meta.scanned_at = m.scanned_at;
+                meta.scan_millis = m.scan_millis;
+                loaded = Some(entry);
+                stale = !cli.cached;
+            }
+            None if cli.cached => bail!("no cached snapshot for {}", meta.root.display()),
+            None => {}
+        }
     }
 
     let mut app = App::new(meta, opts, !cli.apparent, save_path);
     app.initial_estimate = estimate;
     app.allow_delete = !cli.no_delete;
     app.pending_baseline = baseline;
+    app.cache_path = cache_path;
     match loaded {
-        Some(entry) => app.set_tree(entry),
+        Some(entry) => {
+            app.set_tree(entry);
+            if stale {
+                app.stale = true;
+                app.start_scan(None);
+            }
+        }
         None => app.start_scan(None),
     }
     let mut terminal = ratatui::init();
@@ -150,7 +197,7 @@ fn headless(
     loaded: Option<tree::Entry>,
     estimate: Option<scan::Estimate>,
     opts: ScanOptions,
-    out: PathBuf,
+    outs: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
     let entry = match loaded {
         Some(e) => e,
@@ -221,7 +268,10 @@ fn headless(
         bail!("nothing scanned");
     }
     let tree = tree::Tree::from_entry(entry, tree::SortKey::Disk);
-    snapshot::save(&out, &tree, &meta)?;
-    eprintln!("saved {}", out.display());
+    for out in outs {
+        cache::ensure_dir(&out)?;
+        snapshot::save(&out, &tree, &meta)?;
+        eprintln!("saved {}", out.display());
+    }
     Ok(())
 }

@@ -76,7 +76,14 @@ fn draw_initial_scan(f: &mut Frame, app: &App) {
     let label = |s: &'static str| Span::styled(format!("{s:>9}  "), Style::new().fg(DIM));
     let mut lines = vec![
         Line::from(vec![
-            Span::styled(format!("{spinner} scanning "), Style::new().fg(ACCENT)),
+            Span::styled(
+                if p.saving.load(Relaxed) {
+                    format!("{spinner} saving snapshot of ")
+                } else {
+                    format!("{spinner} scanning ")
+                },
+                Style::new().fg(ACCENT),
+            ),
             Span::raw(job.path.display().to_string()).bold(),
         ]),
         Line::raw(""),
@@ -143,6 +150,13 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" "),
         Span::styled(path, Style::new().bold()),
     ];
+    if app.stale {
+        left.push(Span::raw("  "));
+        left.push(Span::styled(
+            format!(" cached {} · refreshing… ", fmt::ago(app.meta.scanned_at)),
+            Style::new().fg(Color::Black).bg(Color::Yellow),
+        ));
+    }
     if has_problem(vr.flags) {
         left.push(Span::styled(
             "  ! some entries unreadable",
@@ -220,6 +234,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 if job.kind == JobKind::Delete {
                     " ✗ deleting "
+                } else if p.saving.load(Relaxed) {
+                    " ⟳ saving snapshot "
                 } else {
                     " ⟳ refreshing "
                 },

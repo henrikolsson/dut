@@ -8,11 +8,13 @@ use anyhow::{Context, bail};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"DUTSNAP\0";
 const VERSION: u32 = 2;
 
+#[derive(Clone)]
 pub struct Meta {
     pub root: PathBuf,
     pub one_file_system: bool,
@@ -70,7 +72,14 @@ fn get_bytes(r: &mut impl Read) -> std::io::Result<Box<[u8]>> {
 pub fn save(path: &Path, tree: &Tree, meta: &Meta) -> anyhow::Result<()> {
     // Write to a temp file and rename so a crash never leaves a torn snapshot.
     let tmp = path.with_extension("dut.tmp");
-    let file = File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    // Snapshots list every file name, so keep them private.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
     let mut w = BufWriter::with_capacity(1 << 20, file);
     w.write_all(MAGIC)?;
     w.write_all(&VERSION.to_le_bytes())?;

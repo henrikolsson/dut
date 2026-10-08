@@ -3,6 +3,7 @@ use crate::scan::{self, Estimate, Progress, ScanOptions};
 use crate::snapshot::{self, Meta};
 use crate::tree::{Entry, Kind, NO_PARENT, NodeId, SortKey, Tree, flags};
 use crate::treemap::Rect;
+use anyhow::Context;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -94,8 +95,24 @@ pub enum JobKind {
 }
 
 enum JobResult {
+    /// A rescanned subtree.
     Scan(anyhow::Result<Entry>),
+    Full(anyhow::Result<FullScan>),
     Delete(Vec<String>),
+}
+
+struct FullScan {
+    tree: Tree,
+    /// Sort order the tree was built with.
+    sort: SortKey,
+    meta: Meta,
+    cache_err: Option<anyhow::Error>,
+}
+
+struct ViewState {
+    view_root: Vec<Box<[u8]>>,
+    cursor: Option<Vec<Box<[u8]>>>,
+    expanded: Vec<Vec<Box<[u8]>>>,
 }
 
 pub struct Job {
@@ -139,6 +156,13 @@ pub struct App {
     pub diff: Option<Diff>,
     /// Baseline to compare against once the initial scan completes.
     pub pending_baseline: Option<(Entry, u64)>,
+    /// Where full scans are automatically saved, unless disabled.
+    pub cache_path: Option<PathBuf>,
+    /// The tree changed (subtree refresh, delete) since the cache was written.
+    pub cache_dirty: bool,
+    cache_err: Option<anyhow::Error>,
+    /// Showing a cached snapshot while the background refresh runs.
+    pub stale: bool,
 
     // Tree view
     pub expanded: HashSet<NodeId>,
@@ -201,6 +225,10 @@ impl App {
             allow_delete: true,
             diff: None,
             pending_baseline: None,
+            cache_path: None,
+            cache_dirty: false,
+            cache_err: None,
+            stale: false,
             expanded: HashSet::new(),
             rows: Vec::new(),
             rows_dirty: true,
@@ -224,7 +252,10 @@ impl App {
     }
 
     pub fn set_tree(&mut self, entry: Entry) {
-        let tree = Tree::from_entry(entry, self.sort);
+        self.set_built_tree(Tree::from_entry(entry, self.sort));
+    }
+
+    fn set_built_tree(&mut self, tree: Tree) {
         self.view_root = tree.root;
         self.tree = Some(tree);
         self.generation += 1;
@@ -287,10 +318,41 @@ impl App {
         let progress = Arc::new(Progress::with_estimate(estimate));
         let (tx, rx) = std::sync::mpsc::channel();
         let (p, opts, scan_path) = (progress.clone(), self.opts.clone(), path.clone());
+        let (sort, cache, mut meta) = (self.sort, self.cache_path.clone(), self.meta.clone());
         std::thread::Builder::new()
             .name("dut-scan".into())
             .spawn(move || {
-                let _ = tx.send(JobResult::Scan(scan::scan(&scan_path, opts, &p)));
+                let t0 = Instant::now();
+                let res = scan::scan(&scan_path, opts, &p);
+                let msg = match (target, res) {
+                    (Some(_), res) => JobResult::Scan(res),
+                    (None, Err(e)) => JobResult::Full(Err(e)),
+                    (None, Ok(entry)) => {
+                        // Build the arena and write the cache here, off the
+                        // UI thread.
+                        let tree = Tree::from_entry(entry, sort);
+                        meta.scanned_at = now_unix();
+                        meta.scan_millis = t0.elapsed().as_millis() as u64;
+                        let cancelled = p.cancel.load(std::sync::atomic::Ordering::Relaxed);
+                        let cache_err = match &cache {
+                            Some(c) if !cancelled => {
+                                p.saving.store(true, std::sync::atomic::Ordering::Relaxed);
+                                crate::cache::ensure_dir(c)
+                                    .map_err(anyhow::Error::from)
+                                    .and_then(|()| snapshot::save(c, &tree, &meta))
+                                    .err()
+                            }
+                            _ => None,
+                        };
+                        JobResult::Full(Ok(FullScan {
+                            tree,
+                            sort,
+                            meta,
+                            cache_err,
+                        }))
+                    }
+                };
+                let _ = tx.send(msg);
             })
             .expect("spawning scan thread");
         self.job = Some(Job {
@@ -313,10 +375,9 @@ impl App {
             }
         };
         let job = self.job.take().unwrap();
-        let res = match res {
-            JobResult::Scan(r) => r,
-            JobResult::Delete(errors) => return self.finish_delete(job, errors),
-        };
+        if let JobResult::Delete(errors) = res {
+            return self.finish_delete(job, errors);
+        }
         if job
             .progress
             .cancel
@@ -329,31 +390,24 @@ impl App {
             return;
         }
         let elapsed = job.started.elapsed();
-        let entry = match res {
-            Ok(e) => e,
-            Err(e) => {
-                if self.tree.is_none() {
-                    // Nothing to show; surface the error and exit.
-                    eprintln!("dut: {}: {e:#}", job.path.display());
-                    self.quit = true;
-                }
-                self.flash(format!("scan failed: {e:#}"));
-                return;
-            }
+        let result = match res {
+            JobResult::Scan(r) => r.map(|e| self.apply_subtree(job.target.unwrap(), e)),
+            JobResult::Full(r) => r.map(|full| self.apply_full(full)),
+            JobResult::Delete(_) => unreachable!(),
         };
+        if let Err(e) = result {
+            if self.tree.is_none() {
+                // Nothing to show; surface the error and exit.
+                eprintln!("dut: {}: {e:#}", job.path.display());
+                self.quit = true;
+            }
+            self.flash(format!("scan failed: {e:#}"));
+            return;
+        }
         let errors = job
             .progress
             .errors
             .load(std::sync::atomic::Ordering::Relaxed);
-        if self.tree.is_none() {
-            self.set_tree(entry);
-        } else {
-            self.apply_refresh(job.target, entry);
-        }
-        if job.target.is_none() {
-            self.meta.scanned_at = now_unix();
-            self.meta.scan_millis = elapsed.as_millis() as u64;
-        }
         let mut msg = format!(
             "scanned {} in {}",
             job.path.display(),
@@ -362,58 +416,103 @@ impl App {
         if errors > 0 {
             msg += &format!(" ({errors} errors)");
         }
+        if let Some(e) = self.cache_err.take() {
+            msg += &format!(" · cache not saved: {e:#}");
+        }
         self.flash(msg);
     }
 
-    /// Swaps in a rescanned subtree while preserving the view state (zoom,
-    /// expanded dirs, selection) by re-resolving it via names.
-    fn apply_refresh(&mut self, target: Option<NodeId>, entry: Entry) {
-        let sort = self.sort;
-        let tree = self.tree.as_mut().unwrap();
+    /// Captures zoom, expanded dirs and selection as name chains, which
+    /// survive the tree being rebuilt.
+    fn capture_view(&self) -> ViewState {
+        let tree = self.tree.as_ref().unwrap();
         let root = tree.root;
-        let cursor = self.rows.get(self.tree_pos.sel).map(|r| r.id);
         let chain = |id: NodeId| tree.name_chain(root, id);
-        let view_chain = chain(self.view_root);
-        let cursor_chain = cursor.map(chain);
-        let expanded: Vec<_> = self.expanded.iter().map(|&id| chain(id)).collect();
-
-        let target_id = target.unwrap_or(root);
-        // Keep what was there as the baseline for the changes view, unless
-        // an existing baseline already covers this path.
-        let target_path = tree.path(target_id);
-        if !self.diff.as_ref().is_some_and(|d| d.covers(&target_path)) {
-            let time = self.meta.scanned_at;
-            self.diff = Some(if target.is_none() {
-                let old = std::mem::replace(tree, Tree::from_entry(entry, sort));
-                Diff::from_tree(old, time)
-            } else {
-                let mut old = tree.to_entry(target_id);
-                old.name = target_path.as_os_str().as_bytes().into();
-                tree.replace(target_id, entry, sort);
-                Diff::new(old, time)
-            });
-        } else {
-            tree.replace(target_id, entry, sort);
+        ViewState {
+            view_root: chain(self.view_root),
+            cursor: self.rows.get(self.tree_pos.sel).map(|r| chain(r.id)),
+            expanded: self.expanded.iter().map(|&id| chain(id)).collect(),
         }
-        if tree.garbage > tree.nodes.len() / 2 {
-            // Too much dead weight from refreshes; rebuild the arena.
-            let e = tree.to_entry(tree.root);
-            *tree = Tree::from_entry(e, sort);
-        }
+    }
 
+    fn restore_view(&mut self, vs: ViewState) {
+        let tree = self.tree.as_ref().unwrap();
         let root = tree.root;
-        self.view_root = tree.resolve_chain(root, &view_chain);
-        self.expanded = expanded
+        self.view_root = tree.resolve_chain(root, &vs.view_root);
+        self.expanded = vs
+            .expanded
             .iter()
             .map(|c| tree.resolve_chain(root, c))
             .collect();
-        let cursor = cursor_chain.map(|c| tree.resolve_chain(root, &c));
+        let cursor = vs.cursor.map(|c| tree.resolve_chain(root, &c));
         self.generation += 1;
         self.structure_gen += 1;
         self.rebuild_rows();
         if let Some(c) = cursor {
             self.select_id(c);
         }
+    }
+
+    /// Installs a freshly scanned full tree. The tree it replaces becomes the
+    /// baseline for the changes view, unless one is already set.
+    fn apply_full(&mut self, full: FullScan) {
+        let FullScan {
+            mut tree,
+            sort,
+            meta,
+            cache_err,
+        } = full;
+        if sort != self.sort {
+            tree.sort_all(self.sort);
+        }
+        self.cache_err = cache_err;
+        self.cache_dirty = self.cache_path.is_some() && self.cache_err.is_some();
+        self.stale = false;
+        let old_time = self.meta.scanned_at;
+        self.meta.scanned_at = meta.scanned_at;
+        self.meta.scan_millis = meta.scan_millis;
+        if self.tree.is_none() {
+            self.set_built_tree(tree);
+            return;
+        }
+        let vs = self.capture_view();
+        let old = self.tree.replace(tree).unwrap();
+        if self
+            .diff
+            .as_ref()
+            .is_some_and(|d| d.covers(&self.meta.root))
+        {
+            // Freeing millions of nodes takes a moment; don't block the UI.
+            std::thread::spawn(move || drop(old));
+        } else {
+            self.diff = Some(Diff::from_tree(old, old_time));
+        }
+        self.restore_view(vs);
+    }
+
+    /// Swaps in a rescanned subtree, keeping the old one as the baseline
+    /// unless an existing baseline already covers it.
+    fn apply_subtree(&mut self, target: NodeId, entry: Entry) {
+        let vs = self.capture_view();
+        let sort = self.sort;
+        let time = self.meta.scanned_at;
+        let tree = self.tree.as_mut().unwrap();
+        let target_path = tree.path(target);
+        if self.diff.as_ref().is_some_and(|d| d.covers(&target_path)) {
+            tree.replace(target, entry, sort);
+        } else {
+            let mut old = tree.to_entry(target);
+            old.name = target_path.as_os_str().as_bytes().into();
+            tree.replace(target, entry, sort);
+            self.diff = Some(Diff::new(old, time));
+        }
+        if tree.garbage > tree.nodes.len() / 2 {
+            // Too much dead weight from refreshes; rebuild the arena.
+            let e = tree.to_entry(tree.root);
+            *tree = Tree::from_entry(e, sort);
+        }
+        self.cache_dirty = self.cache_path.is_some();
+        self.restore_view(vs);
     }
 
     // ---- tree view -------------------------------------------------------
@@ -509,6 +608,9 @@ impl App {
         if !self.allow_delete {
             return self.flash("deleting is disabled (--no-delete)");
         }
+        if self.stale {
+            return self.flash("showing a cached snapshot; wait for the refresh before deleting");
+        }
         let Some(id) = self.selected() else { return };
         let tree = self.tree.as_ref().unwrap();
         if id == tree.root || id == self.view_root {
@@ -555,6 +657,7 @@ impl App {
             let parent = tree.node(id).parent;
             tree.remove(id, sort);
             self.expanded.remove(&id);
+            self.cache_dirty = self.cache_path.is_some();
             self.generation += 1;
             self.structure_gen += 1;
             self.rebuild_rows();
@@ -1081,6 +1184,21 @@ impl App {
                     }
                 }
             }
+        }
+        if let Some(j) = &self.job {
+            j.progress
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Persist subtree refreshes / deletes so the next run starts from them.
+        if let (true, Some(path)) = (
+            self.cache_dirty && self.tree.is_some(),
+            self.cache_path.clone(),
+        ) {
+            self.flash("saving cache…");
+            terminal.draw(|f| crate::ui::draw(f, &mut self))?;
+            let tree = self.tree.as_ref().unwrap();
+            snapshot::save(&path, tree, &self.meta).context("saving cache")?;
         }
         Ok(())
     }
