@@ -36,6 +36,15 @@
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          meta = {
+            description = "Fast TUI disk usage analyzer that remembers previous scans";
+            homepage = "https://github.com/henrikolsson/dut";
+            license = with pkgs.lib.licenses; [
+              mit
+              asl20
+            ];
+            mainProgram = "dut";
+          };
         };
       }
     );

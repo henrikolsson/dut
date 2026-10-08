@@ -167,3 +167,8 @@ screenshots with [VHS](https://github.com/charmbracelet/vhs):
 ```sh
 nix shell nixpkgs#vhs nixpkgs#libfaketime -c nix develop -c demo/record.sh
 ```
+
+## License
+
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT), at your option.
