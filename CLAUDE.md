@@ -50,6 +50,11 @@ the Linux side with
 
 ## Conventions
 
+- Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/):
+  `type(scope): summary`, with types like `feat`, `fix`, `perf`, `refactor`,
+  `docs`, `test`, `build`, `ci` and `chore`. The scope is optional, often a
+  module or platform (`feat(macos): ...`, `fix(scan): ...`). Mark breaking
+  changes with `!` or a `BREAKING CHANGE:` footer.
 - Comments explain why, not what. Keep them as short as the surrounding ones.
 - Prefer std and libc over new dependencies.
 - Scanning must never follow symlinks, and deleting must never cross into
