@@ -1,54 +1,134 @@
 # dut
 
-Fast interactive disk usage analyzer for the terminal.
+**A fast disk usage analyzer for the terminal that remembers.** It scans in
+parallel, opens instantly from the last scan while it refreshes, and shows
+what grew since last time.
 
-- **Fast**: parallel work-stealing scanner (rayon), `fstatat` relative to the
-  open directory, compact arena tree. ~6.2M files in ~4s warm on a laptop.
-- **Views**: expandable tree with size bars, squarified treemap, largest
-  files, and usage by file type.
-- **Any root**: `dut /some/path`; zoom in/out inside the UI.
-- **One filesystem**: `-x` stays on the root's filesystem.
-- **Snapshots**: save the scan (`w` in the UI, or `-o`), reopen it later with
-  `-f`, and refresh all of it (`R`) or one directory (`r`).
-- **Progress/ETA**: estimated from the previous scan when refreshing, or from
-  filesystem usage when scanning a mount root.
-- **Automatic snapshots**: every full scan is cached in `~/.cache/dut/`
-  (per root and options, mode 0600). Next time, `dut PATH` opens the cached
-  result instantly, refreshes it in the background, and shows what changed.
-  `--cached` skips the refresh, `--no-cache` turns it off, `DUT_CACHE_DIR`
-  overrides the location. A subdirectory of a cached root opens from the
-  parent's snapshot. A history is kept (3 latest, then daily for a week and
-  weekly for 8 weeks; roots unused for 90 days are dropped; 2 GiB cap), shown
-  in the History view. `--cache-list` and `--clear-cache [PATH]` manage it.
-- **Changes**: compare against an older snapshot (`--diff old.dut`) or the
-  state before a refresh. The tree gets a +/- column, and view `5` lists the
-  biggest growers, new and removed entries.
-- **Excludes**: `-e node_modules -e '*.o' -e '/home/*/.cache'` (names, or full
-  paths when the pattern has a `/`). Stored in snapshots and reused on refresh.
-- **Delete** with `d` (confirmation required; never follows symlinks or
-  crosses filesystems). `--no-delete` disables it.
-- Disk usage (allocated blocks) by default, so sparse files count correctly;
-  `a` toggles apparent size. Hard links are counted once.
+![dut demo](demo/demo.gif)
+
+## Why
+
+`du`, `ncdu` and friends answer *"what is big?"*. dut also answers *"what got
+big?"*. Every scan is kept as a compact snapshot. Next time you open the same
+directory you see the old result immediately, the rescan runs in the
+background, and changes show up as `+1.2 G` / `-300 M` next to each entry.
+
+## Views
+
+| | |
+|---|---|
+| **Tree**: expandable, with size bars and changes since the last scan<br>![tree](demo/tree.png) | **Treemap**: squarified, nested, navigable with arrow keys<br>![treemap](demo/treemap.png) |
+| **Changes**: biggest growth, new and removed entries<br>![changes](demo/changes.png) | **History**: size over time and growth per entry<br>![history](demo/history.png) |
+
+Plus **Largest files** (top 1000 under the current directory) and **File
+types** (usage by extension; Enter lists the files of that type).
+
+## Features
+
+- **Fast.** A work-stealing parallel scanner (rayon) stats entries relative
+  to the open directory fd. Huge directories are split across threads, and
+  results go into a compact arena tree. See [Performance](#performance).
+- **Instant reopen.** Full scans are cached in `~/.cache/dut`. Opening a
+  directory you've scanned before shows the cached result at once, marked
+  as cached, and swaps in the fresh scan when it's done. A subdirectory of a
+  cached root opens from the parent's snapshot.
+- **Progress with an ETA.** The estimate comes from the previous scan, or
+  from filesystem usage when you scan a mount root.
+- **Changes and history.** Compare with the previous scan, with any saved
+  snapshot (`--diff old.dut`), or with any point in the cached history.
+- **Correct sizes.** Shows allocated disk usage by default, so sparse files
+  count what they really use; `a` toggles apparent size. Hard links are
+  counted once.
+- **Stays where you point it.** `-x` stays on one filesystem; `-e` excludes
+  globs (`node_modules`, `*.o`, `/home/*/.cache`).
+- **Careful deletes.** `d` asks first. It never follows symlinks or crosses
+  into another filesystem, and reports anything it couldn't remove.
+  `--no-delete` turns deleting off.
+- **Snapshots you can keep.** `w` saves the scan; `dut -f file.dut` reopens
+  it anywhere. The format is lz4-compressed, about 10 bytes per entry.
+
+## Install
+
+```sh
+# Nix
+nix run .            # or: nix profile install .
+
+# Cargo
+cargo install --path .
+```
 
 ## Usage
 
-```
-dut [PATH]                         scan and browse (default: .)
-dut -x /                           don't cross into other mounts
-dut -f home.dut                    browse a saved snapshot
-dut -f home.dut --refresh          rescan the snapshot's root, then browse
-dut ~/ --no-ui                     refresh the automatic snapshot (cron-friendly)
-dut -c ~/                          open the automatic snapshot without rescanning
-dut ~/ -o home.dut --no-ui         scan and also save to a file
-dut ~/ --diff home.dut             scan and show what changed since the snapshot
-dut -f home.dut -r -o home.dut --no-ui   refresh a snapshot headlessly
+```sh
+dut                         # current directory
+dut -x /                    # whole root filesystem, don't cross mounts
+dut -e node_modules ~/src   # skip entries by glob (repeatable)
+dut -c ~                    # open the cached snapshot without rescanning
+
+dut ~ --no-ui               # refresh the cache without a UI (cron-friendly)
+dut ~ -o home.dut --no-ui   # ...and also save to a file
+dut -f home.dut             # browse a saved snapshot
+dut -f home.dut --refresh   # rescan it and show what changed
+dut ~ --diff home.dut       # scan and compare with a snapshot
+
+dut --cache-list            # what's cached, and how much space it takes
+dut --clear-cache [PATH]    # forget everything, or one root
 ```
 
-Press `?` in the UI for keys.
+### Keys
+
+| Key | |
+|---|---|
+| `1`–`6`, `v` | tree · treemap · largest files · file types · changes · history |
+| `j` `k` `↑` `↓`, `PgUp` `PgDn`, `g` `G` | move |
+| `l` `→` / `h` `←`, `space` | expand / collapse |
+| `*` / `-` | expand subtree / collapse all |
+| `enter` / `backspace` | zoom into directory / back out |
+| `a` | disk usage ↔ apparent size |
+| `s` | sort by size · items · name |
+| `r` / `R` | rescan selected directory / everything |
+| `d` | delete (asks first) |
+| `w` | save snapshot |
+| `?` | help |
+
+## Performance
+
+On one laptop (12 cores, NVMe, ext4), with the filesystem cache warm:
+
+| Tree | Entries | dut | GNU `du -sx` |
+|---|---|---|---|
+| `/nix/store` | 6.2 M | ~4 s | ~2.5 min |
+| `~/dev` | 369 k | 181 ms ± 8 ms | |
+
+With a cold cache it's I/O bound: the first `/nix/store` scan took 13.6 s.
+Loading a cached snapshot of 6.2M entries takes about a second and peaks
+around 680 MB of memory. The `du` figure is a single run. Your numbers will
+vary; to benchmark, run `hyperfine` with `dut --no-cache --no-ui -o out.dut DIR`.
+
+## Snapshots and the cache
+
+Snapshots live in `$XDG_CACHE_HOME/dut` (or `DUT_CACHE_DIR`), one per root
+and option set (`-x`, excludes), readable only by you (`0600`). History is
+pruned automatically:
+
+- the 3 newest, then one per day for a week, then one per week for 8 weeks
+- roots not scanned for 90 days are dropped
+- total size is capped at 2 GiB, removing the oldest history first
+
+`--no-cache` disables reading and writing it.
 
 ## Development
 
-```
-nix develop
+```sh
+nix develop          # rust toolchain
+cargo test
 cargo build --release
+```
+
+The demo is reproducible: `demo/make-demo.sh` builds a fake home directory
+with backdated snapshots, and `demo/record.sh` records the GIF and
+screenshots with [VHS](https://github.com/charmbracelet/vhs):
+
+```sh
+nix shell nixpkgs#vhs nixpkgs#libfaketime -c nix develop -c demo/record.sh
 ```

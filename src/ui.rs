@@ -644,7 +644,13 @@ fn draw_cell(
         .title(Span::styled(label, title_style));
     let inner = block.inner(r);
     block.render(r, buf);
-    if n.is_dir() && depth < 1 && inner.width >= 6 && inner.height >= 3 {
+    // Nest a second level only where there is room for it to stay legible.
+    let room = match depth {
+        0 => inner.width >= 6 && inner.height >= 3,
+        1 => inner.width >= 16 && inner.height >= 6,
+        _ => false,
+    };
+    if n.is_dir() && room {
         let items = tm_items(app, tree, id, 200);
         for (cid, cr) in layout_in(&items, inner) {
             draw_cell(buf, app, tree, cid, cr, color, depth + 1, false, total);
