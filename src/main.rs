@@ -3,6 +3,9 @@ mod cache;
 mod delete;
 mod diff;
 mod fmt;
+#[cfg(target_os = "macos")]
+mod macos;
+mod mounts;
 mod scan;
 mod snapshot;
 mod tree;
@@ -43,6 +46,11 @@ struct Cli {
     #[arg(short = 'x', long)]
     one_file_system: bool,
 
+    /// Also descend into virtual (/proc, /sys, /dev) and network (NFS, SMB,
+    /// sshfs) filesystems, which are skipped by default
+    #[arg(long, conflicts_with = "one_file_system")]
+    all_mounts: bool,
+
     /// Number of scanner threads [default: 2x cores]
     #[arg(short = 'j', long)]
     threads: Option<usize>,
@@ -70,7 +78,8 @@ struct Cli {
     #[arg(long)]
     no_ui: bool,
 
-    /// Don't read or write automatic snapshots (in ~/.cache/dut)
+    /// Don't read or write automatic snapshots (in ~/.cache/dut, or
+    /// ~/Library/Caches/dut on macOS)
     #[arg(long)]
     no_cache: bool,
 
@@ -105,6 +114,7 @@ fn main() -> anyhow::Result<()> {
         tree::SortKey::Disk
     };
     let mut one_file_system = cli.one_file_system;
+    let mut all_mounts = cli.all_mounts;
     let mut exclude = cli.exclude.clone();
 
     // What to show first: an explicit snapshot, a cached one, or a fresh scan.
@@ -114,6 +124,7 @@ fn main() -> anyhow::Result<()> {
         Some(file) => {
             let (tree, meta) = snapshot::load(file, sort)?;
             one_file_system |= meta.one_file_system;
+            all_mounts |= meta.all_mounts;
             for p in &meta.exclude {
                 if !exclude.contains(p) {
                     exclude.push(p.clone());
@@ -133,6 +144,7 @@ fn main() -> anyhow::Result<()> {
                 root: std::fs::canonicalize(&path)
                     .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?,
                 one_file_system,
+                all_mounts,
                 scanned_at: app::now_unix(),
                 scan_millis: 0,
                 exclude: Vec::new(),
@@ -143,12 +155,17 @@ fn main() -> anyhow::Result<()> {
         let (tree, m) = snapshot::load(file, tree::SortKey::Name)?;
         baseline = Some((tree, m.scanned_at));
     }
+    // -x is stricter, and wins over a snapshot's --all-mounts.
+    all_mounts &= !one_file_system;
     meta.one_file_system = one_file_system;
+    meta.all_mounts = all_mounts;
     meta.exclude = exclude.clone();
     let opts = ScanOptions {
         one_file_system,
+        all_mounts,
         threads: cli.threads.unwrap_or_else(scan::default_threads),
         exclude: std::sync::Arc::new(scan::Excludes::new(exclude.clone())?),
+        aliases: std::sync::Arc::new(scan::aliases(&meta.root)),
     };
     let use_cache = !cli.no_cache && cache::dir().is_some();
 
@@ -169,7 +186,8 @@ fn main() -> anyhow::Result<()> {
             .latest()
             .and_then(|p| snapshot::load(&p, sort).ok());
         let cached = own.or_else(|| {
-            let (file, m) = cache::find_ancestor(&meta.root, one_file_system, &exclude)?;
+            let (file, m) =
+                cache::find_ancestor(&meta.root, one_file_system, all_mounts, &exclude)?;
             let sub = snapshot::load_tree(&file, sort, Some(&meta.root), None).ok()?;
             stale_source = Some(m.root);
             Some(sub)
@@ -238,6 +256,9 @@ fn cache_list() -> anyhow::Result<()> {
         if l.meta.one_file_system {
             opts += " -x";
         }
+        if l.meta.all_mounts {
+            opts += " --all-mounts";
+        }
         for e in &l.meta.exclude {
             opts += &format!(" -e {e}");
         }
@@ -280,7 +301,7 @@ fn headless(
                     // Excluded entries would make a filesystem-wide estimate wrong.
                     opts.exclude
                         .is_empty()
-                        .then(|| scan::estimate_fs(&meta.root, opts.one_file_system))
+                        .then(|| scan::estimate_fs(&meta.root, &opts))
                         .flatten()
                 });
             let progress = Progress::with_estimate(estimate);

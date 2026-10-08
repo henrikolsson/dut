@@ -18,6 +18,8 @@ const VERSION: u32 = 2;
 pub struct Meta {
     pub root: PathBuf,
     pub one_file_system: bool,
+    /// Scanned with `--all-mounts`.
+    pub all_mounts: bool,
     /// Unix timestamp (seconds) of when the scan finished.
     pub scanned_at: u64,
     pub scan_millis: u64,
@@ -86,7 +88,7 @@ pub fn save(path: &Path, tree: &Tree, meta: &Meta) -> anyhow::Result<()> {
 
     let mut z = lz4_flex::frame::FrameEncoder::new(w);
     put_bytes(&mut z, meta.root.as_os_str().as_bytes())?;
-    z.write_all(&[meta.one_file_system as u8])?;
+    z.write_all(&[meta.one_file_system as u8 | (meta.all_mounts as u8) << 1])?;
     put_varint(&mut z, meta.scanned_at)?;
     put_varint(&mut z, meta.scan_millis)?;
     put_varint(&mut z, meta.exclude.len() as u64)?;
@@ -143,7 +145,8 @@ fn open(path: &Path) -> anyhow::Result<(impl Read, Meta)> {
     z.read_exact(&mut b)?;
     let mut meta = Meta {
         root,
-        one_file_system: b[0] != 0,
+        one_file_system: b[0] & 1 != 0,
+        all_mounts: b[0] & 2 != 0,
         scanned_at: get_varint(&mut z)?,
         scan_millis: get_varint(&mut z)?,
         exclude: Vec::new(),
@@ -343,6 +346,8 @@ mod tests {
             one_file_system: true,
             threads: 2,
             exclude: Arc::new(Excludes::new(exclude.clone()).unwrap()),
+            all_mounts: false,
+            aliases: Default::default(),
         };
         let e = scan(&dir, opts, &Progress::default()).unwrap();
         let (items, size, disk) = (e.items, e.size, e.disk);
@@ -352,6 +357,7 @@ mod tests {
         let meta = Meta {
             root: dir.clone(),
             one_file_system: true,
+            all_mounts: false,
             scanned_at: 42,
             scan_millis: 7,
             exclude: exclude.clone(),

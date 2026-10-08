@@ -2,9 +2,11 @@
 //!
 //! Each directory is read on a rayon worker; subdirectories are recursed into
 //! in parallel via work stealing. Entries are stat-ed relative to the open
-//! directory fd (std's `DirEntry::metadata` uses `fstatat`), so the kernel
-//! never re-walks full paths per file.
+//! directory fd (std's `DirEntry::metadata` uses `fstatat` on Linux), so the
+//! kernel never re-walks full paths per file. On macOS, `getattrlistbulk`
+//! fetches a whole directory's sizes at once.
 
+use crate::mounts;
 use crate::tree::{Entry, Kind, flags};
 use anyhow::Context;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -28,6 +30,23 @@ pub struct ScanOptions {
     pub one_file_system: bool,
     pub threads: usize,
     pub exclude: Arc<Excludes>,
+    /// Also enter virtual and network filesystems (see [`crate::mounts`]).
+    pub all_mounts: bool,
+    /// Directories that are also reachable under another path of the scanned
+    /// tree (macOS firmlinks). They're skipped so nothing is counted twice.
+    pub aliases: Arc<HashSet<PathBuf>>,
+}
+
+/// See [`ScanOptions::aliases`]; `root` is the root of the whole tree, even
+/// when only part of it is being rescanned.
+pub fn aliases(root: &Path) -> HashSet<PathBuf> {
+    #[cfg(target_os = "macos")]
+    return crate::macos::firmlink_duplicates(root);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = root;
+        HashSet::new()
+    }
 }
 
 /// Glob patterns for entries to skip entirely. Patterns without a `/` match
@@ -118,71 +137,67 @@ impl Progress {
     }
 }
 
-/// Estimates scan totals from filesystem usage. Only valid when `path` is the
-/// root of a mount whose whole filesystem is visible from there (not a bind
-/// mount or subvolume), and only when the scan won't wander into other
-/// mounts below it.
-pub fn estimate_fs(path: &Path, one_file_system: bool) -> Option<Estimate> {
+/// Estimates scan totals from filesystem usage: that of the mount at `path`
+/// plus every mount below it the scan will enter. Only when `path` is a
+/// mount point, and each of those mounts shows its whole filesystem (not a
+/// bind mount or subvolume).
+pub fn estimate_fs(path: &Path, opts: &ScanOptions) -> Option<Estimate> {
     let path = fs::canonicalize(path).ok()?;
-    let mountinfo = fs::read("/proc/self/mountinfo").ok()?;
-    let target = path.as_os_str().as_bytes();
-    // Fields: id parent major:minor root mount_point ...
-    let mut prefix = target.to_vec();
-    if prefix.last() != Some(&b'/') {
-        prefix.push(b'/');
-    }
-    let (mut full_fs_mount, mut has_submounts) = (false, false);
-    for line in mountinfo.split(|&b| b == b'\n') {
-        let mut f = line.split(|&b| b == b' ');
-        let (Some(root), Some(mnt)) = (f.nth(3), f.next()) else {
+    let all = mounts::list();
+    let own = all.iter().find(|m| m.dir == path)?;
+    let mut below: Vec<&mounts::Mount> = all
+        .iter()
+        .filter(|m| m.dir != path && m.dir.starts_with(&path))
+        .collect();
+    below.sort_by_key(|m| m.dir.components().count());
+    let mut entered = vec![own];
+    let mut not_entered: Vec<&Path> = Vec::new();
+    for m in below {
+        if not_entered.iter().any(|d| m.dir.starts_with(d)) {
             continue;
-        };
-        let mnt = unescape_mount(mnt);
-        if mnt == target {
-            full_fs_mount = root == b"/";
-        } else if mnt.starts_with(&prefix) {
-            has_submounts = true;
+        }
+        if enters_mount(&path, m, opts) {
+            entered.push(m);
+        } else {
+            not_entered.push(&m.dir);
         }
     }
-    if !full_fs_mount || (has_submounts && !one_file_system) {
-        return None;
+    let (mut items, mut disk, mut have_items) = (0, 0, true);
+    for m in entered {
+        if !m.whole {
+            return None;
+        }
+        let (bytes, inodes) = mounts::usage(&m.dir)?;
+        disk += bytes;
+        items += inodes;
+        // Some filesystems (btrfs, zfs) report no meaningful inode counts.
+        have_items &= inodes > 0;
     }
-    let cpath = std::ffi::CString::new(target).ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(cpath.as_ptr(), &mut st) } != 0 {
-        return None;
-    }
-    let used_bytes = (st.f_blocks - st.f_bfree) as u64 * st.f_frsize as u64;
-    // Some filesystems (btrfs, zfs) report no meaningful inode counts.
-    let used_inodes = (st.f_files as u64).saturating_sub(st.f_ffree as u64);
-    (used_bytes > 0).then_some(Estimate {
-        items: used_inodes,
-        disk: used_bytes,
+    (disk > 0).then_some(Estimate {
+        items: if have_items { items } else { 0 },
+        disk,
         source: "filesystem usage",
     })
 }
 
-/// Mount points in mountinfo escape space, tab, newline and backslash as octal.
-fn unescape_mount(s: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len());
-    let mut i = 0;
-    while i < s.len() {
-        if s[i] == b'\\'
-            && i + 3 < s.len()
-            && s[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
-        {
-            out.push((s[i + 1] - b'0') * 64 + (s[i + 2] - b'0') * 8 + (s[i + 3] - b'0'));
-            i += 4;
-        } else {
-            out.push(s[i]);
-            i += 1;
-        }
+/// Whether a scan of `root` descends into mount `m` below it.
+fn enters_mount(root: &Path, m: &mounts::Mount, opts: &ScanOptions) -> bool {
+    // The macOS data volume is firmlinked into / and scanned with it.
+    #[cfg(target_os = "macos")]
+    if root == Path::new("/") && m.dir == Path::new(crate::macos::DATA_VOLUME) {
+        return true;
     }
-    out
+    let _ = root;
+    !opts.one_file_system && (opts.all_mounts || !m.skip)
 }
 
 struct Ctx<'a> {
     root_dev: u64,
+    /// Another device that counts as the root's filesystem for `-x`: the
+    /// macOS data volume, firmlinked into the system volume.
+    paired_dev: Option<u64>,
+    /// Virtual and network mount points to skip.
+    skip_mounts: HashSet<PathBuf>,
     opts: ScanOptions,
     progress: &'a Progress,
     /// (dev, ino) of multiply-linked files already counted.
@@ -203,8 +218,20 @@ pub fn scan(root: &Path, opts: ScanOptions, progress: &Progress) -> anyhow::Resu
     let root = fs::canonicalize(root)?;
     let md = fs::symlink_metadata(&root)?;
     let threads = opts.threads.max(1);
+    #[cfg(target_os = "macos")]
+    let paired_dev = crate::macos::data_volume_dev()
+        .filter(|_| fs::symlink_metadata("/").is_ok_and(|r| r.dev() == md.dev()));
+    #[cfg(not(target_os = "macos"))]
+    let paired_dev = None;
+    let skip_mounts = if opts.one_file_system || opts.all_mounts {
+        HashSet::new()
+    } else {
+        mounts::skipped_below(&root)
+    };
     let ctx = Ctx {
         root_dev: md.dev(),
+        paired_dev,
+        skip_mounts,
         opts,
         progress,
         hardlinks: Mutex::new(HashSet::new()),
@@ -218,7 +245,7 @@ pub fn scan(root: &Path, opts: ScanOptions, progress: &Progress) -> anyhow::Resu
             .stack_size(16 << 20)
             .thread_name(|i| format!("dut-scan-{i}"))
             .build()?;
-        pool.install(|| scan_dir(&ctx, &root, &mut entry));
+        pool.install(|| scan_dir(&ctx, &root, &mut entry, md.dev()));
     }
     Ok(entry)
 }
@@ -254,14 +281,7 @@ fn stat_entry(ctx: &Ctx, de: &DirEntry) -> (Entry, u64) {
     match de.metadata() {
         Ok(md) => {
             let mut e = entry_from_meta(name, &md);
-            if e.kind != Kind::Dir && md.nlink() > 1 {
-                let fresh = ctx.hardlinks.lock().unwrap().insert((md.dev(), md.ino()));
-                if !fresh {
-                    e.flags |= flags::HARDLINK;
-                    e.size = 0;
-                    e.disk = 0;
-                }
-            }
+            count_hardlink(ctx, &mut e, md.nlink(), md.dev(), md.ino());
             (e, md.dev())
         }
         Err(_) => {
@@ -271,50 +291,132 @@ fn stat_entry(ctx: &Ctx, de: &DirEntry) -> (Entry, u64) {
                 Ok(ft) if ft.is_file() => Kind::File,
                 _ => Kind::Other,
             };
-            let e = Entry {
-                name,
-                kind,
-                flags: flags::ERROR,
-                size: 0,
-                disk: 0,
-                items: 1,
-                children: Vec::new(),
-            };
-            (e, ctx.root_dev)
+            (error_entry(name, kind), ctx.root_dev)
         }
     }
 }
 
-fn scan_dir(ctx: &Ctx, path: &Path, dir: &mut Entry) {
-    if ctx.progress.cancel.load(Relaxed) {
-        return;
+fn error_entry(name: Box<[u8]>, kind: Kind) -> Entry {
+    Entry {
+        name,
+        kind,
+        flags: flags::ERROR,
+        size: 0,
+        disk: 0,
+        items: 1,
+        children: Vec::new(),
     }
-    let rd = match fs::read_dir(path) {
-        Ok(rd) => rd,
-        Err(_) => {
-            dir.flags |= flags::ERROR;
-            ctx.progress.errors.fetch_add(1, Relaxed);
-            return;
+}
+
+/// Zeroes the sizes of a file whose inode was already counted.
+fn count_hardlink(ctx: &Ctx, e: &mut Entry, nlink: u64, dev: u64, ino: u64) {
+    if e.kind != Kind::Dir && nlink > 1 {
+        let fresh = ctx.hardlinks.lock().unwrap().insert((dev, ino));
+        if !fresh {
+            e.flags |= flags::HARDLINK;
+            e.size = 0;
+            e.disk = 0;
         }
-    };
+    }
+}
+
+/// Reads and stats the entries of `path`, minus excluded ones. Returns the
+/// entries with their device ids and whether reading stopped early, or
+/// `None` if the directory couldn't be opened.
+#[cfg(not(target_os = "macos"))]
+fn read_entries(ctx: &Ctx, path: &Path) -> Option<(Vec<(Entry, u64)>, bool)> {
+    read_entries_std(ctx, path)
+}
+
+fn read_entries_std(ctx: &Ctx, path: &Path) -> Option<(Vec<(Entry, u64)>, bool)> {
+    let rd = fs::read_dir(path).ok()?;
     let mut read_error = false;
     let exclude = &ctx.opts.exclude;
     let des: Vec<DirEntry> = rd
         .filter_map(|r| r.map_err(|_| read_error = true).ok())
         .filter(|de| exclude.is_empty() || !exclude.matches(path, &de.file_name()))
         .collect();
-    if read_error {
-        dir.flags |= flags::ERROR;
-        ctx.progress.errors.fetch_add(1, Relaxed);
-    }
-
     let stat = |de: &DirEntry| stat_entry(ctx, de);
-    let stated: Vec<(Entry, u64)> = if des.len() > PAR_STAT_THRESHOLD {
+    let stated = if des.len() > PAR_STAT_THRESHOLD {
         des.par_iter().with_min_len(512).map(stat).collect()
     } else {
         des.iter().map(stat).collect()
     };
-    drop(des);
+    Some((stated, read_error))
+}
+
+/// macOS: one `getattrlistbulk` call per batch of entries instead of an
+/// `lstat` each. Directories still get an `fstatat`, for their real device.
+#[cfg(target_os = "macos")]
+fn read_entries(ctx: &Ctx, path: &Path) -> Option<(Vec<(Entry, u64)>, bool)> {
+    use crate::macos;
+    let dir = macos::open_dir(path).ok()?;
+    let exclude = &ctx.opts.exclude;
+    let mut out = Vec::new();
+    let res = macos::read_dir(&dir, |a| {
+        if !exclude.is_empty() && exclude.matches(path, OsStr::from_bytes(a.name)) {
+            return;
+        }
+        let name: Box<[u8]> = a.name.into();
+        if a.error {
+            return out.push((error_entry(name, a.kind), ctx.root_dev));
+        }
+        if a.kind == Kind::Dir {
+            return out.push(match macos::stat_at(&dir, a.name) {
+                Ok(st) => {
+                    let e = Entry {
+                        name,
+                        kind: Kind::Dir,
+                        flags: 0,
+                        size: st.st_size as u64,
+                        disk: st.st_blocks as u64 * 512,
+                        items: 1,
+                        children: Vec::new(),
+                    };
+                    (e, st.st_dev as u64)
+                }
+                Err(_) => (error_entry(name, Kind::Dir), ctx.root_dev),
+            });
+        }
+        let mut e = Entry {
+            name,
+            kind: a.kind,
+            flags: 0,
+            size: a.size,
+            disk: a.disk,
+            items: 1,
+            children: Vec::new(),
+        };
+        count_hardlink(ctx, &mut e, a.nlink as u64, a.dev, a.ino);
+        out.push((e, a.dev));
+    });
+    match res {
+        Ok(()) => Some((out, false)),
+        // Not supported here (shouldn't happen: the kernel emulates it for
+        // filesystems without native support).
+        Err(e)
+            if out.is_empty() && matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP)) =>
+        {
+            read_entries_std(ctx, path)
+        }
+        Err(_) => Some((out, true)),
+    }
+}
+
+/// Scans the directory at `path`, which is on device `dir_dev`.
+fn scan_dir(ctx: &Ctx, path: &Path, dir: &mut Entry, dir_dev: u64) {
+    if ctx.progress.cancel.load(Relaxed) {
+        return;
+    }
+    let Some((stated, read_error)) = read_entries(ctx, path) else {
+        dir.flags |= flags::ERROR;
+        ctx.progress.errors.fetch_add(1, Relaxed);
+        return;
+    };
+    if read_error {
+        dir.flags |= flags::ERROR;
+        ctx.progress.errors.fetch_add(1, Relaxed);
+    }
 
     let mut children = Vec::with_capacity(stated.len());
     let mut subdirs = Vec::new();
@@ -326,14 +428,29 @@ fn scan_dir(ctx: &Ctx, path: &Path, dir: &mut Entry) {
             errors += 1;
         }
         if e.kind == Kind::Dir && e.flags & flags::ERROR == 0 {
-            if ctx.opts.one_file_system && dev != ctx.root_dev {
-                e.flags |= flags::OTHER_FS;
+            let child = || path.join(OsStr::from_bytes(&e.name));
+            let aliases = &ctx.opts.aliases;
+            let skip =
+                if ctx.opts.one_file_system && dev != ctx.root_dev && Some(dev) != ctx.paired_dev {
+                    flags::OTHER_FS
+                } else if dev != dir_dev
+                    && !ctx.skip_mounts.is_empty()
+                    && ctx.skip_mounts.contains(&child())
+                {
+                    flags::SKIPPED_FS
+                } else if !aliases.is_empty() && aliases.contains(&child()) {
+                    flags::ALIAS
+                } else {
+                    0
+                };
+            if skip != 0 {
+                e.flags |= skip;
                 disk -= e.disk;
                 e.size = 0;
                 e.disk = 0;
                 children.push(e);
             } else {
-                subdirs.push(e);
+                subdirs.push((e, dev));
             }
         } else {
             children.push(e);
@@ -347,12 +464,12 @@ fn scan_dir(ctx: &Ctx, path: &Path, dir: &mut Entry) {
         p.errors.fetch_add(errors, Relaxed);
     }
 
-    subdirs.par_iter_mut().for_each(|sub| {
+    subdirs.par_iter_mut().for_each(|(sub, dev)| {
         let child_path: PathBuf = path.join(OsStr::from_bytes(&sub.name));
-        scan_dir(ctx, &child_path, sub);
+        scan_dir(ctx, &child_path, sub, *dev);
     });
 
-    children.append(&mut subdirs);
+    children.extend(subdirs.into_iter().map(|(e, _)| e));
     for c in &children {
         dir.size += c.size;
         dir.disk += c.disk;

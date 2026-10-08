@@ -33,14 +33,18 @@ types** (usage by extension; Enter lists the files of that type).
   as cached, and swaps in the fresh scan when it's done. A subdirectory of a
   cached root opens from the parent's snapshot.
 - **Progress with an ETA.** The estimate comes from the previous scan, or
-  from filesystem usage when you scan a mount root.
+  from filesystem usage (of every mount the scan will enter) when you scan
+  a mount root.
 - **Changes and history.** Compare with the previous scan, with any saved
   snapshot (`--diff old.dut`), or with any point in the cached history.
 - **Correct sizes.** Shows allocated disk usage by default, so sparse files
   count what they really use; `a` toggles apparent size. Hard links are
   counted once.
-- **Stays where you point it.** `-x` stays on one filesystem; `-e` excludes
-  globs (`node_modules`, `*.o`, `/home/*/.cache`).
+- **Stays where you point it.** Other mounts are scanned too, except
+  virtual filesystems (`/proc`, `/sys`, `/dev`) and network ones (NFS, SMB,
+  sshfs), which are skipped unless you pass `--all-mounts`. `-x` stays on
+  one filesystem; `-e` excludes globs (`node_modules`, `*.o`,
+  `/home/*/.cache`).
 - **Careful deletes.** `d` asks first. It never follows symlinks or crosses
   into another filesystem, and reports anything it couldn't remove.
   `--no-delete` turns deleting off.
@@ -53,7 +57,7 @@ types** (usage by extension; Enter lists the files of that type).
 # Nix
 nix run .            # or: nix profile install .
 
-# Cargo
+# Cargo (Linux, macOS)
 cargo install --path .
 ```
 
@@ -61,6 +65,7 @@ cargo install --path .
 
 ```sh
 dut                         # current directory
+dut /                       # everything, minus virtual and network mounts
 dut -x /                    # whole root filesystem, don't cross mounts
 dut -e node_modules ~/src   # skip entries by glob (repeatable)
 dut -c ~                    # open the cached snapshot without rescanning
@@ -107,7 +112,8 @@ vary; to benchmark, run `hyperfine` with `dut --no-cache --no-ui -o out.dut DIR`
 
 ## Snapshots and the cache
 
-Snapshots live in `$XDG_CACHE_HOME/dut` (or `DUT_CACHE_DIR`), one per root
+Snapshots live in `$XDG_CACHE_HOME/dut` (default `~/.cache/dut`, or
+`~/Library/Caches/dut` on macOS; `DUT_CACHE_DIR` overrides both), one per root
 and option set (`-x`, excludes), readable only by you (`0600`). History is
 pruned automatically:
 
@@ -116,6 +122,26 @@ pruned automatically:
 - total size is capped at 2 GiB, removing the oldest history first
 
 `--no-cache` disables reading and writing it.
+
+## macOS
+
+dut runs on Linux and macOS. On a Mac:
+
+- **Scanning `/` counts everything once.** `/Users`, `/Applications` and
+  friends are firmlinks into the data volume at `/System/Volumes/Data`, so
+  the same files are reachable twice. dut reads `/usr/share/firmlinks` and
+  skips the duplicate side, which shows as *(firmlink, counted elsewhere)*.
+  `-x /` covers the system and data volumes together. Mounted snapshots
+  (Time Machine's local ones) are skipped like network mounts.
+- **Scanning is batched.** Sizes come from `getattrlistbulk`, a whole
+  directory per call, instead of one `lstat` per file.
+- **Totals can differ from Finder.** APFS clones (Finder duplicates,
+  `cp -c`) share blocks but each reports its full size, so they're counted
+  in full, as `du` does. Local Time Machine snapshots and purgeable space
+  aren't visible to a directory scan at all.
+- **Some folders need Full Disk Access.** Without it, `~/Library/Mail`,
+  `~/Library/Messages`, Safari data and similar show up as unreadable (`!`).
+  Grant your terminal access in System Settings → Privacy & Security.
 
 ## Development
 

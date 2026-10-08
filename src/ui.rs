@@ -219,6 +219,8 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
     );
     if app.meta.one_file_system {
         right += " · one fs";
+    } else if app.meta.all_mounts {
+        right += " · all mounts";
     }
     if !app.meta.exclude.is_empty() {
         right += &format!(" · {} excludes", app.meta.exclude.len());
@@ -393,6 +395,18 @@ fn name_spans(tree: &Tree, id: NodeId) -> Vec<Span<'static>> {
     }
     if n.flags & flags::OTHER_FS != 0 {
         v.push(Span::styled("  (other filesystem)", Style::new().fg(DIM)));
+    }
+    if n.flags & flags::SKIPPED_FS != 0 {
+        v.push(Span::styled(
+            "  (virtual or network filesystem, skipped)",
+            Style::new().fg(DIM),
+        ));
+    }
+    if n.flags & flags::ALIAS != 0 {
+        v.push(Span::styled(
+            "  (firmlink, counted elsewhere)",
+            Style::new().fg(DIM),
+        ));
     }
     if n.kind == Kind::File && n.size > (1 << 20) && n.disk < n.size / 2 {
         v.push(Span::styled(
@@ -802,6 +816,12 @@ fn draw_help(f: &mut Frame) {
         "  ! marks unreadable entries (or ones below)",
         Style::new().fg(DIM),
     ));
+    if cfg!(target_os = "macos") {
+        lines.push(Line::styled(
+            "  (give the terminal Full Disk Access to read Mail, Messages etc.)",
+            Style::new().fg(DIM),
+        ));
+    }
     let area = centered(f.area(), 72, lines.len() as u16 + 2);
     f.render_widget(Clear, area);
     let block = Block::bordered()

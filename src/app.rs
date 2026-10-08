@@ -354,7 +354,7 @@ impl App {
                 self.opts
                     .exclude
                     .is_empty()
-                    .then(|| scan::estimate_fs(&path, self.opts.one_file_system))
+                    .then(|| scan::estimate_fs(&path, &self.opts))
                     .flatten()
             }),
         };

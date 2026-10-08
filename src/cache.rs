@@ -29,6 +29,9 @@ pub fn dir() -> Option<PathBuf> {
     }
     let base = match std::env::var_os("XDG_CACHE_HOME") {
         Some(x) if !x.is_empty() => PathBuf::from(x),
+        _ if cfg!(target_os = "macos") => {
+            PathBuf::from(std::env::var_os("HOME")?).join("Library/Caches")
+        }
         _ => PathBuf::from(std::env::var_os("HOME")?).join(".cache"),
     };
     Some(base.join("dut"))
@@ -39,10 +42,14 @@ pub fn dir() -> Option<PathBuf> {
 pub struct Key(String);
 
 impl Key {
-    pub fn new(root: &Path, one_file_system: bool, exclude: &[String]) -> Key {
+    pub fn new(root: &Path, one_file_system: bool, all_mounts: bool, exclude: &[String]) -> Key {
         let mut h = Fnv::default();
         h.write(root.as_os_str().as_bytes());
         h.write(&[0, one_file_system as u8]);
+        // Only hashed when set, so keys from before the option still match.
+        if all_mounts {
+            h.write(b"\0all-mounts");
+        }
         for e in sorted(exclude) {
             h.write(&[0]);
             h.write(e.as_bytes());
@@ -64,7 +71,12 @@ impl Key {
     }
 
     pub fn of(meta: &Meta) -> Key {
-        Key::new(&meta.root, meta.one_file_system, &meta.exclude)
+        Key::new(
+            &meta.root,
+            meta.one_file_system,
+            meta.all_mounts,
+            &meta.exclude,
+        )
     }
 
     /// Where a snapshot taken at `scanned_at` is stored.
@@ -241,6 +253,7 @@ pub fn clear(root: Option<&Path>) -> (usize, u64) {
 pub fn find_ancestor(
     root: &Path,
     one_file_system: bool,
+    all_mounts: bool,
     exclude: &[String],
 ) -> Option<(PathBuf, Meta)> {
     // Only the latest snapshot of each key matters.
@@ -261,6 +274,7 @@ pub fn find_ancestor(
             root != m.root
                 && root.starts_with(&m.root)
                 && m.one_file_system == one_file_system
+                && m.all_mounts == all_mounts
                 && sorted(&m.exclude) == want
         })
         .max_by_key(|(m, _)| (m.root.components().count(), m.scanned_at))
@@ -291,11 +305,13 @@ mod tests {
     #[test]
     fn key_depends_on_options() {
         let p = Path::new("/home/me/My Stuff");
-        let a = Key::new(p, false, &[]);
-        let b = Key::new(p, true, &[]);
-        let c = Key::new(p, false, &["x".into(), "y".into()]);
-        let d = Key::new(p, false, &["y".into(), "x".into()]);
+        let a = Key::new(p, false, false, &[]);
+        let b = Key::new(p, true, false, &[]);
+        let c = Key::new(p, false, false, &["x".into(), "y".into()]);
+        let d = Key::new(p, false, false, &["y".into(), "x".into()]);
+        let e = Key::new(p, false, true, &[]);
         assert_ne!(a, b);
+        assert_ne!(a, e);
         assert_ne!(a, c);
         assert_eq!(c, d);
         assert!(a.0.starts_with("My_Stuff-"));

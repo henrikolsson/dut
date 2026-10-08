@@ -37,6 +37,11 @@ pub mod flags {
     pub const OTHER_FS: u8 = 4;
     /// Hard link to an inode already counted elsewhere; size counted as zero.
     pub const HARDLINK: u8 = 8;
+    /// Directory also reachable under another path in the tree (a macOS
+    /// firmlink, e.g. /System/Volumes/Data/Users is /Users); counted there.
+    pub const ALIAS: u8 = 16;
+    /// Mount point of a virtual or network filesystem, skipped by default.
+    pub const SKIPPED_FS: u8 = 32;
 }
 
 /// Entry produced by the scanner (or snapshot loader) before being placed in
