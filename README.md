@@ -1,5 +1,7 @@
 # dut
 
+[![CI](https://github.com/henrikolsson/dut/actions/workflows/ci.yml/badge.svg)](https://github.com/henrikolsson/dut/actions/workflows/ci.yml)
+
 **A fast disk usage analyzer for the terminal that remembers.** It scans in
 parallel, opens instantly from the last scan while it refreshes, and shows
 what grew since last time.
@@ -52,6 +54,9 @@ types** (usage by extension; Enter lists the files of that type).
   it anywhere. The format is lz4-compressed, about 10 bytes per entry.
 
 ## Install
+
+Prebuilt binaries for Linux (static, x86_64 and arm64) and macOS (Apple
+silicon and Intel) are on the [releases page](https://github.com/henrikolsson/dut/releases).
 
 ```sh
 # Nix
@@ -150,6 +155,9 @@ nix develop          # rust toolchain
 cargo test
 cargo build --release
 ```
+
+CI runs fmt, clippy and the tests on Linux and macOS, plus the Nix build.
+Pushing a `v*` tag builds release binaries and publishes a GitHub release.
 
 The demo is reproducible: `demo/make-demo.sh` builds a fake home directory
 with backdated snapshots, and `demo/record.sh` records the GIF and

@@ -140,6 +140,7 @@ fn unescape(s: &[u8]) -> Vec<u8> {
 
 /// Used bytes and inodes (0 if the filesystem doesn't track them).
 #[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_cast)] // the statvfs fields are 32-bit on some targets
 pub fn usage(dir: &Path) -> Option<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     let cpath = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
